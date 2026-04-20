@@ -39,18 +39,18 @@ and handle everything else cheaply.
 
 ### Key Terminology
 
-| Term | Definition |
-|------|-----------|
-| N | Total number of rows in the dataset |
-| M | Number of unique groups |
-| C | Cache capacity in number of groups (L1+L2 fit ~C groups) |
-| k | Number of top results requested by the query |
-| FA | Fine-grained Aggregates — exact tracker for candidate groups |
-| CA | Coarse-grained Aggregates — rough tracker for non-candidate groups |
-| topKBound | The k-th largest aggregate seen so far in FA; used as a pruning threshold |
-| Candidate | A group identified by sampling as likely to appear in the final top-k |
-| Partition | A bucket of non-candidate groups, hashed together in CA |
-| Pruning | Eliminating an entire CA partition because its max possible aggregate < topKBound |
+| Term      | Definition                                                                        |
+| --------- | --------------------------------------------------------------------------------- |
+| N         | Total number of rows in the dataset                                               |
+| M         | Number of unique groups                                                           |
+| C         | Cache capacity in number of groups (L1+L2 fit ~C groups)                          |
+| k         | Number of top results requested by the query                                      |
+| FA        | Fine-grained Aggregates — exact tracker for candidate groups                      |
+| CA        | Coarse-grained Aggregates — rough tracker for non-candidate groups                |
+| topKBound | The k-th largest aggregate seen so far in FA; used as a pruning threshold         |
+| Candidate | A group identified by sampling as likely to appear in the final top-k             |
+| Partition | A bucket of non-candidate groups, hashed together in CA                           |
+| Pruning   | Eliminating an entire CA partition because its max possible aggregate < topKBound |
 
 ---
 
@@ -91,12 +91,14 @@ else:
 ```
 
 **FA structure** (hash table, cache-resident):
+
 - Key: group_id
 - Value: exact running aggregate (sum, count, max, or min depending on query)
 - Capacity: C_FA entries (fixed at initialization)
 - Lookup: O(1) open-addressing hash table
 
 **CA structure** (array of partition structs, cache-resident):
+
 - Indexed by `hash(group_id) % n_partitions`
 - Each entry stores: `{total_sum, max_value, count}`
 - `total_sum`: sum of all values routed to this partition
@@ -143,6 +145,7 @@ partitions. This adds another full pass.
 partitions were copied into dedicated memory regions. Pass 2 only reads those regions.
 
 Zippy decides between logical and physical partitioning adaptively:
+
 - If a partition is likely to be pruned → logical (don't waste memory copy effort)
 - If a partition is likely to survive → physical (pay copy cost now, save re-scan later)
 
@@ -165,24 +168,24 @@ with these algorithms, **these algorithms take precedence.**
 
 Variable name mapping from paper → used in this document and codebase:
 
-| Paper variable | Meaning |
-|---------------|---------|
-| K | k (number of top results) |
-| N | n_rows (total rows) |
-| M | n_groups (unique groups) |
-| CF | fa_capacity (max FA entries, cache-sized) |
-| C | total cache size in groups |
-| Q | n_partitions (logical partitions CA can hold in cache) |
-| X | grouping column(s) |
-| Y | aggregate (measure) column |
-| A | aggregation function (SUM, COUNT, MAX, MIN) |
-| s | segment size (for locality calculation) |
-| α₀ | locality constant threshold |
-| α, β | confidence levels for CI bounds in sampling |
-| Lk | K-th highest lower-bound in sample CI bounds |
-| Cp | size of a specific partition being processed |
-| Tc | lowest aggregated count among FA groups |
-| E | estimated elements per logical partition = Cp / Q |
+| Paper variable | Meaning                                                |
+| -------------- | ------------------------------------------------------ |
+| K              | k (number of top results)                              |
+| N              | n_rows (total rows)                                    |
+| M              | n_groups (unique groups)                               |
+| CF             | fa_capacity (max FA entries, cache-sized)              |
+| C              | total cache size in groups                             |
+| Q              | n_partitions (logical partitions CA can hold in cache) |
+| X              | grouping column(s)                                     |
+| Y              | aggregate (measure) column                             |
+| A              | aggregation function (SUM, COUNT, MAX, MIN)            |
+| s              | segment size (for locality calculation)                |
+| α₀             | locality constant threshold                            |
+| α, β           | confidence levels for CI bounds in sampling            |
+| Lk             | K-th highest lower-bound in sample CI bounds           |
+| Cp             | size of a specific partition being processed           |
+| Tc             | lowest aggregated count among FA groups                |
+| E              | estimated elements per logical partition = Cp / Q      |
 
 ---
 
@@ -224,6 +227,7 @@ Procedure TopKAggregation:
 ```
 
 **Implementation notes for Algorithm 1:**
+
 - `partitions = data` in line 2 means the first "partition" is the entire dataset
   (no physical partitioning has happened yet). In subsequent passes, `partitions`
   refers only to surviving child partitions from the previous pass.
@@ -278,6 +282,7 @@ Procedure ValidateAndIdentifyFAgroups:
 ```
 
 **Implementation notes for Algorithm 2:**
+
 - **CI bounds (lines 13–14):** The paper uses confidence intervals computed from the
   sample to determine which groups are statistically likely to be in the top-k. The
   lower bound of a group's CI is a conservative estimate of its true aggregate. Only
@@ -348,6 +353,7 @@ Procedure AggregateAndPartition:
 ```
 
 **Implementation notes for Algorithm 3:**
+
 - **Locality check (lines 4–10):** Locality l measures how concentrated groups are
   within segments of the data. Low l (< α₀) means groups are already locally
   clustered, so exact aggregation is efficient (few cache misses). In the prototype,
@@ -403,6 +409,7 @@ Procedure MergeAndPrune:
 ```
 
 **Implementation notes for Algorithm 4:**
+
 - **Upper bound (UB) computation (lines 5–7):** For SUM queries, the UB of any
   group in a child partition = childPartition's `total_sum`. This is the key pruning
   invariant: since all values are non-negative, no single group within a partition
@@ -459,6 +466,7 @@ The problem is unnecessary extra passes.
 ### Extension A: Stratified Sampling via Grouping Column Index
 
 **Paper quote (Section 7):**
+
 > "Adding indexes on the groups can help perform stratified sampling to have more
 > coverage of rare groups."
 
@@ -466,6 +474,7 @@ The problem is unnecessary extra passes.
 preprocessing step before the main sampling phase.
 
 **Group Occurrence Index structure:**
+
 ```
 GroupIndex: unordered_map<group_id, vector<row_position>>
 ```
@@ -474,6 +483,7 @@ Built in one sequential scan of the dataset. Records which row positions belong 
 each group. This is the "index on grouping columns."
 
 **Stratified Sampling Algorithm:**
+
 ```
 Phase 1 (uniform): Sample s1_fraction of rows randomly → mini_aggregate → sample_counts
 Phase 2 (stratified correction):
@@ -488,6 +498,7 @@ Merge Phase 1 and Phase 2 aggregates → pick top C_FA as FA candidates
 ```
 
 **Key design parameters (tune experimentally):**
+
 - `UNDERREP_THRESHOLD`: fraction below which a group is considered underrepresented
   (e.g., 0.5 means "if we got less than 50% of expected representation")
 - `BOOST_ROWS`: how many rows to fetch from the index for an underrepresented group
@@ -500,6 +511,7 @@ storing all row positions (can be reduced with sampling of positions).
 ### Extension B: Measure Column Index for Extreme Value Detection
 
 **Paper quote (Section 7):**
+
 > "With indexes on measure columns, we may be able to identify tuples with extreme
 > values and add the corresponding groups in the first aggregation pass to process
 > them earlier."
@@ -509,6 +521,7 @@ storing all row positions (can be reduced with sampling of positions).
 FA before normal sampling.
 
 **Measure Column Index structure:**
+
 ```
 MeasureIndex: min-heap of size m, storing (value, group_id) pairs
 ```
@@ -517,6 +530,7 @@ Built in one sequential scan. After the scan, the heap contains the m rows with
 the highest individual values.
 
 **Integration with Zippy:**
+
 ```
 Step 1: Build MeasureIndex in one pass → extract top-m group IDs (call this FORCED_SET)
 Step 2: Reserve |FORCED_SET| FA slots for FORCED_SET groups
@@ -525,6 +539,7 @@ Step 4: Run normal Zippy from Phase 1 onward
 ```
 
 **Key design parameter:**
+
 - `m`: how many extreme-value rows to look at (tune experimentally)
   - Too small: miss some rare high-value groups
   - Too large: waste FA slots on groups whose one extreme value doesn't represent
@@ -539,7 +554,7 @@ and m vs. (index build overhead). Find the knee of the curve.
 ## 5. Project Architecture
 
 ```
-zippy-topk/
+zippy-optimizer/
 ├── AGENTS.md                    ← this file
 │
 ├── src/                         ← C++ core engine
@@ -815,14 +830,14 @@ for gid in rare_group_ids:
 
 Every experiment run must collect these metrics for comparison across modes:
 
-| Metric | Description | Why It Matters |
-|--------|-------------|----------------|
-| `fa_hit_rate` | Fraction of true top-k groups that appear in FA after sampling | Core measure of sampling quality — our extensions should improve this |
-| `partitions_pruned_pct` | Fraction of CA partitions pruned after Pass 1 | Higher = less work in Pass 2+ |
-| `total_passes` | Number of data passes until convergence | Main efficiency metric — our extensions should reduce this |
-| `total_duration_ms` | Wall-clock time for full query | Overall performance |
-| `index_build_duration_ms` | Time to build GroupIndex / MeasureIndex | Extension overhead cost |
-| `topKBound_after_pass1` | Value of topKBound after the first pass | Higher = better pruning |
+| Metric                    | Description                                                    | Why It Matters                                                        |
+| ------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `fa_hit_rate`             | Fraction of true top-k groups that appear in FA after sampling | Core measure of sampling quality — our extensions should improve this |
+| `partitions_pruned_pct`   | Fraction of CA partitions pruned after Pass 1                  | Higher = less work in Pass 2+                                         |
+| `total_passes`            | Number of data passes until convergence                        | Main efficiency metric — our extensions should reduce this            |
+| `total_duration_ms`       | Wall-clock time for full query                                 | Overall performance                                                   |
+| `index_build_duration_ms` | Time to build GroupIndex / MeasureIndex                        | Extension overhead cost                                               |
+| `topKBound_after_pass1`   | Value of topKBound after the first pass                        | Higher = better pruning                                               |
 
 ---
 
@@ -833,13 +848,13 @@ should sweep these parameters and produce one JSON result per configuration.
 
 ### Datasets
 
-| ID | n_rows | n_groups | zipf_alpha | rare_group_fraction | rare_group_rows | rare_value_mult |
-|----|--------|----------|------------|---------------------|-----------------|-----------------|
-| S1 | 10M | 1M | 1.2 | 0.0 | — | — |
-| S2 | 10M | 1M | 1.2 | 0.0001 | 3 | 100× |
-| S3 | 10M | 1M | 1.2 | 0.001 | 3 | 100× |
-| S4 | 50M | 5M | 1.2 | 0.0001 | 3 | 100× |
-| S5 | 10M | 1M | 0.8 | 0.0001 | 3 | 100× |
+| ID  | n_rows | n_groups | zipf_alpha | rare_group_fraction | rare_group_rows | rare_value_mult |
+| --- | ------ | -------- | ---------- | ------------------- | --------------- | --------------- |
+| S1  | 10M    | 1M       | 1.2        | 0.0                 | —               | —               |
+| S2  | 10M    | 1M       | 1.2        | 0.0001              | 3               | 100×            |
+| S3  | 10M    | 1M       | 1.2        | 0.001               | 3               | 100×            |
+| S4  | 50M    | 5M       | 1.2        | 0.0001              | 3               | 100×            |
+| S5  | 10M    | 1M       | 0.8        | 0.0001              | 3               | 100×            |
 
 S1 = favorable (no rare groups, baseline should do well)
 S2/S3 = adversarial (rare groups, extensions should help)
@@ -912,6 +927,7 @@ target_include_directories(zippy PRIVATE src/)
 ```
 
 Build and run:
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
