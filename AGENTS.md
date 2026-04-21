@@ -39,18 +39,26 @@ and handle everything else cheaply.
 
 ### Key Terminology
 
-| Term      | Definition                                                                        |
-| --------- | --------------------------------------------------------------------------------- |
-| N         | Total number of rows in the dataset                                               |
-| M         | Number of unique groups                                                           |
-| C         | Cache capacity in number of groups (L1+L2 fit ~C groups)                          |
-| k         | Number of top results requested by the query                                      |
-| FA        | Fine-grained Aggregates — exact tracker for candidate groups                      |
-| CA        | Coarse-grained Aggregates — rough tracker for non-candidate groups                |
-| topKBound | The k-th largest aggregate seen so far in FA; used as a pruning threshold         |
-| Candidate | A group identified by sampling as likely to appear in the final top-k             |
-| Partition | A bucket of non-candidate groups, hashed together in CA                           |
-| Pruning   | Eliminating an entire CA partition because its max possible aggregate < topKBound |
+| Term | Definition |
+|------|-----------|
+| N | Total number of rows in the dataset |
+| M | Number of unique groups |
+| C | Total L1+L2 cache capacity for a single core, measured in number of (key, aggregate) pairs |
+| Cf | Cache space allocated to FA = C/2 |
+| Cc | Cache space allocated to CA = C/2 |
+| k | Number of top results requested by the query |
+| FA | Fine-grained Aggregates — exact tracker for candidate groups |
+| CA | Coarse-grained Aggregates — rough tracker for non-candidate groups |
+| topKBound | The k-th largest aggregate seen so far in FA; used as a pruning threshold |
+| Candidate | A group identified by sampling as likely to appear in the final top-k |
+| Partition | A bucket of non-candidate groups, hashed together in CA |
+| Pruning | Eliminating an entire CA partition because its max possible aggregate < topKBound |
+| Δ (delta) | Sampling tolerance level: groups with population proportion below Δ are excluded from sampling analysis as unlikely candidates |
+| α | Confidence level for sample representativeness (used in sample size formula) |
+| β | Confidence level for Hoeffding CI bounds used in skew validation |
+| Cs | Cache space occupied by CI-qualifying candidate groups |
+| Ch | Cache space occupied by heavy-hitter fill groups |
+| d | Estimated distinct group count within a partition (used in partition ranking and physical/logical decision) |
 
 ---
 
@@ -66,15 +74,15 @@ Before any data pass, Zippy reads a small fraction (configurable, typically 1%) 
 rows at random. It runs a mini-aggregation over this sample to estimate which groups
 will likely rank in the top-k.
 
-The output is a **candidate set**: the top `C_FA` groups by estimated aggregate in
-the sample, where `C_FA` is the number of FA slots available (half the cache budget).
+The output is a **candidate set**: the top `fa_capacity` groups by estimated aggregate
+in the sample, where `fa_capacity` (= Cf = C/2) is the number of FA slots available.
 
 ```
-sample_fraction = 0.01   (1% of rows, configurable)
-candidates = top_C_FA_groups( mini_aggregate(sample) )
+sample_fraction = max(ceil(z²/(4Δ²)), 0.01 × N)   rows sampled
+candidates = top_fa_capacity_groups( mini_aggregate(sample) )
 ```
 
-**Critical constraint:** |candidates| ≤ C_FA. The FA structure must fit in cache.
+**Critical constraint:** |candidates| ≤ fa_capacity. The FA structure must fit in cache.
 
 ### Phase 1: Full Data Scan — Populating FA and CA
 
@@ -91,20 +99,31 @@ else:
 ```
 
 **FA structure** (hash table, cache-resident):
-
 - Key: group_id
 - Value: exact running aggregate (sum, count, max, or min depending on query)
-- Capacity: C_FA entries (fixed at initialization)
-- Lookup: O(1) open-addressing hash table
+- Capacity: Cf entries (= C/2, half the total L1+L2 cache budget for this core)
+- Implementation: **single-level open-addressing hash table with linear probing**
+  (explicitly confirmed by patent). Linear probing is chosen over chaining because
+  it eliminates pointer-following branches and keeps all data in contiguous memory,
+  maximising cache-line utilisation.
+- Allocated array size: `2 × Cf` slots (50% load factor to minimise collision chains)
+- Empty-slot sentinel: use `UINT64_MAX` as the empty key value — never store it as
+  a real group_id. Handle it by masking group_ids to `[0, UINT64_MAX - 1]`.
+- Lookup: O(1) average, branch-free inner loop
 
 **CA structure** (array of partition structs, cache-resident):
-
 - Indexed by `hash(group_id) % n_partitions`
-- Each entry stores: `{total_sum, max_value, count}`
-- `total_sum`: sum of all values routed to this partition
-- `max_value`: maximum single value seen in this partition
+- Each entry stores: `{total_sum, max_value, min_value, count, approx_distinct_count}`
+- `total_sum`: sum of all values routed to this partition (UB for SUM pruning)
+- `max_value`: maximum single row value seen in this partition (UB for MAX pruning)
+- `min_value`: minimum single row value seen in this partition
 - `count`: number of rows routed to this partition
+- `approx_distinct_count`: estimated number of distinct groups in this partition,
+  computed using the **Flajolet-Martin (FM) algorithm** (a single-pass probabilistic
+  distinct count sketch). This is used in the partition ranking step and the
+  logical/physical partitioning decision. See FM implementation note below.
 - This is NOT a per-group tracker — multiple groups hash to the same partition
+- Capacity: Cc = C/2 partitions (equal split with FA)
 
 **Key invariant for SUM queries:**
 For any group g in partition p, g's true total sum ≤ CA[p].total_sum.
@@ -145,7 +164,6 @@ partitions. This adds another full pass.
 partitions were copied into dedicated memory regions. Pass 2 only reads those regions.
 
 Zippy decides between logical and physical partitioning adaptively:
-
 - If a partition is likely to be pruned → logical (don't waste memory copy effort)
 - If a partition is likely to survive → physical (pay copy cost now, save re-scan later)
 
@@ -168,24 +186,31 @@ with these algorithms, **these algorithms take precedence.**
 
 Variable name mapping from paper → used in this document and codebase:
 
-| Paper variable | Meaning                                                |
-| -------------- | ------------------------------------------------------ |
-| K              | k (number of top results)                              |
-| N              | n_rows (total rows)                                    |
-| M              | n_groups (unique groups)                               |
-| CF             | fa_capacity (max FA entries, cache-sized)              |
-| C              | total cache size in groups                             |
-| Q              | n_partitions (logical partitions CA can hold in cache) |
-| X              | grouping column(s)                                     |
-| Y              | aggregate (measure) column                             |
-| A              | aggregation function (SUM, COUNT, MAX, MIN)            |
-| s              | segment size (for locality calculation)                |
-| α₀             | locality constant threshold                            |
-| α, β           | confidence levels for CI bounds in sampling            |
-| Lk             | K-th highest lower-bound in sample CI bounds           |
-| Cp             | size of a specific partition being processed           |
-| Tc             | lowest aggregated count among FA groups                |
-| E              | estimated elements per logical partition = Cp / Q      |
+| Paper variable | Codebase name | Meaning |
+|---------------|--------------|---------|
+| K | k | Number of top results |
+| N | n_rows | Total rows in dataset |
+| M | n_groups | Unique groups |
+| CF | fa_capacity | Max FA entries (= Cf in groups) |
+| C | cache_size | Total L1+L2 per core in (key,agg) pairs |
+| Cf | fa_capacity × sizeof(FAEntry) | FA cache budget = C/2 |
+| Cc | n_partitions × sizeof(CAPartition) | CA cache budget = C/2 |
+| Q | n_partitions | Logical partitions CA can hold in cache |
+| X | grouping column(s) | group_id in binary dataset |
+| Y | aggregate (measure) column | value in binary dataset |
+| A | aggregation function | SUM only in this prototype |
+| s | segment_size | Rows per locality segment (default 100,000) |
+| α₀ | locality_threshold | Locality cutoff (default 0.20) |
+| α | alpha_ci | CI confidence for sample size formula |
+| β | beta_ci | CI confidence for Hoeffding skew validation |
+| Δ | delta | Sampling tolerance level (default 0.05) |
+| Lk | topKBound_sample | K-th highest lower-bound in sample CI |
+| Cp | partition_size | Row count of a specific input partition |
+| Tc | min_fa_count | Lowest row-count among FA candidate groups |
+| E | estimated_elements | Estimated elements per child partition = Cp/Q |
+| Cs | cs_bytes | Cache space of CI-qualifying groups = count × sizeof(FAEntry) |
+| Ch | ch_bytes | Cache space of heavy-hitter fill groups |
+| d | approx_distinct | FM-estimated distinct groups in a partition |
 
 ---
 
@@ -227,7 +252,6 @@ Procedure TopKAggregation:
 ```
 
 **Implementation notes for Algorithm 1:**
-
 - `partitions = data` in line 2 means the first "partition" is the entire dataset
   (no physical partitioning has happened yet). In subsequent passes, `partitions`
   refers only to surviving child partitions from the previous pass.
@@ -282,29 +306,58 @@ Procedure ValidateAndIdentifyFAgroups:
 ```
 
 **Implementation notes for Algorithm 2:**
+- **Sample size formula (line 2):** The patent gives the exact formula. For a
+  tolerance level Δ ∈ [0,1] and confidence level (1−α), the minimum sample size is:
 
-- **CI bounds (lines 13–14):** The paper uses confidence intervals computed from the
-  sample to determine which groups are statistically likely to be in the top-k. The
-  lower bound of a group's CI is a conservative estimate of its true aggregate. Only
-  groups whose lower bound ≥ Lk (the K-th highest lower bound) become FA candidates.
-  For the prototype, a simplified version is acceptable: use the raw sample aggregate
-  as a point estimate (no CI), and select the top-CF groups by sample aggregate as
-  FAgroups. Mark this simplification clearly in code comments.
-- **isOptimizable = False (line 19–22):** Triggered when too many groups pass the CI
-  threshold — meaning data is not skewed enough to benefit from FA/CA separation.
-  The system falls back to full multi-pass aggregation. In the prototype, trigger this
-  when the top-CF groups' sample aggregates are not meaningfully separated from the
-  rest (e.g., when the CF-th and (CF+1)-th sample aggregates are within 5% of each
-  other).
+  ```
+  s ≥ (z_{α/2})² / (4 × Δ²)
+  ```
+
+  where z_{α/2} is the standard normal quantile (e.g., 1.96 for α=0.05, giving
+  95% confidence). This sample size is **independent of N** — it does not grow with
+  the dataset. Δ controls the tolerance for ratio deviation between sample and true
+  group proportions. Groups with true proportion below Δ are not guaranteed to be
+  represented and are treated as too rare to capture via sampling alone (they may
+  still be captured in Pass 2 via partitions).
+
+  Recommended defaults: Δ=0.05, α=0.05 → s ≈ 384. In practice the paper uses
+  larger samples (~1% of N) to get better aggregate estimates; use whichever is
+  larger: the formula bound or `0.01 × N`.
+
+- **Hoeffding CI bounds (lines 13–14):** The patent names this explicitly.
+  For each group i seen in the sample with n'_i sample rows, min value a, max
+  value b, the confidence interval half-width at confidence level β is:
+
+  ```
+  ε_i = (b - a) × sqrt( ln(2 / (1 - β)) / (2 × n'_i) )
+  ```
+
+  The lower bound of group i's aggregate CI is: `sample_aggregate_i - ε_i`.
+  The upper bound is: `sample_aggregate_i + ε_i`.
+  Use β=0.95 as the default confidence level.
+
+  For the prototype simplification: use raw sample aggregates as point estimates
+  (ε_i = 0) and select top-Cf groups by sample aggregate as FA candidates. Mark
+  this simplification clearly in code comments with a TODO for full CI.
+
+- **isOptimizable check (lines 19–22):** The patent clarifies the check is on
+  **cache space** `Cs`, not raw group count. `Cs` is the total memory occupied by
+  grouping keys and aggregate values for all groups whose CI lower bound ≥ Lk.
+  If `Cs > Cf` (where Cf = C/2 is the FA cache budget), validation fails.
+  In the prototype: approximate `Cs` as `|tempGroups| × sizeof(FAEntry)` and
+  compare against the FA capacity budget.
+
 - **Heavy hitter fill (lines 26–29):** After CI-qualifying groups fill tempGroups,
-  remaining FA slots are filled with the highest-frequency groups from the sample
-  (by count, not by aggregate value). This is the paper's robustness mechanism.
+  remaining FA space is filled with heavy hitters (highest sample-count groups not
+  already in tempGroups) until `Cs + Ch ≈ Cf`. The patent notes this reduces
+  tuples sent to CA partitions, improving pruning bounds in subsequent passes.
+
 - **Extension A modifies this algorithm.** The stratified sampler replaces lines 4–11
   with a two-phase sampling procedure that uses the GroupOccurrenceIndex to boost
   underrepresented groups. Lines 12–29 remain unchanged.
 - **Extension B modifies this algorithm.** Before line 25, the MeasureIndex
   FORCED_SET is inserted into FAgroups first, then remaining slots are filled by
-  the CI/heavy-hitter logic. If |FORCED_SET| > CF, truncate to CF (log a warning).
+  the CI/heavy-hitter logic. If |FORCED_SET| > Cf, truncate to Cf (log a warning).
 
 ---
 
@@ -353,15 +406,22 @@ Procedure AggregateAndPartition:
 ```
 
 **Implementation notes for Algorithm 3:**
+- **Locality check constants (lines 4–10):** The patent gives the benchmarked values
+  explicitly: **segment size s = 100,000 rows** and **locality threshold α₀ = 0.20**.
+  These were determined through benchmarking on a specific machine. Use these as the
+  defaults. The locality formula is:
 
-- **Locality check (lines 4–10):** Locality l measures how concentrated groups are
-  within segments of the data. Low l (< α₀) means groups are already locally
-  clustered, so exact aggregation is efficient (few cache misses). In the prototype,
-  **skip the locality check** and always proceed to the partitioning decision
-  (lines 11–20). This is a safe simplification — it means we may do unnecessary
-  partitioning in some cases but never skip necessary partitioning.
+  ```
+  l = (Σ_s  ds/cs) / t
+  ```
+
+  where for each segment s of size cs rows, ds = distinct groups in that segment,
+  and t = total number of segments in the partition. If `l < 0.20`, use exact
+  aggregation. In the prototype, **skip the locality check** and always proceed to
+  the partitioning decision (lines 11–20). This is a safe simplification.
+
 - **exactAggregation path (lines 22–23):** When partition is small enough to fit
-  in cache (distinct groups < CF), or locality is sufficient, aggregate all groups
+  in cache (distinct groups < Cf), or locality is sufficient, aggregate all groups
   in this partition exactly into partialAggregates-i. FA groups are also aggregated
   here (their rows are not sent to childPartitions).
 - **FA group rows (line 22):** Rows belonging to FAgroups are ALWAYS aggregated
@@ -369,13 +429,20 @@ Procedure AggregateAndPartition:
 - **Logical vs physical partitioning decision (lines 12–20):**
   - If the previous pass used logical partitioning for this partition and it was NOT
     pruned, upgrade to physical (line 13). This avoids repeated full re-scans.
-  - Otherwise, compare E (estimated elements per child partition = Cp/Q) to Tc
-    (lowest FA group count). If E < Tc, use logical; else physical.
+  - Otherwise: let Z = max logical partitions CA can hold (= n_partitions), Tc =
+    lowest row-count among FA groups (= the least-frequent FA candidate), C_p =
+    cardinality (row count) of the input partition. Compute `E = C_p / Z`.
+    If `E < Tc`: use logical. Else: use physical.
+  - Intuition: if each logical child partition would have fewer rows than the
+    least-frequent FA candidate, logical is worthwhile (partitions will likely be
+    pruned). Otherwise, physical is better because at least one child may contain
+    a result-bound group.
   - In this project's prototype: **implement logical partitioning only** (see
     Section 16). Physical partitioning (lines 29–33) is out of scope.
 - **childPartitions-i:** These become the `partitions` list for the next pass in
   Algorithm 1. Each child partition is identified by its hash value and contains
-  the CA statistics (total_sum, max_value, count) for that hash bucket.
+  the CA statistics (total_sum, max_value, min_value, count, approx_distinct_count)
+  for that hash bucket.
 
 ---
 
@@ -409,24 +476,40 @@ Procedure MergeAndPrune:
 ```
 
 **Implementation notes for Algorithm 4:**
+- **Upper bound (UB) computation per aggregate type (lines 5–7):**
+  The patent gives the explicit UB formula for each aggregate function:
 
-- **Upper bound (UB) computation (lines 5–7):** For SUM queries, the UB of any
-  group in a child partition = childPartition's `total_sum`. This is the key pruning
-  invariant: since all values are non-negative, no single group within a partition
-  can have a higher sum than the partition total.
+  | Aggregate | UB for any group in partition p |
+  |-----------|--------------------------------|
+  | SUM       | `CA[p].total_sum` |
+  | AVG       | `CA[p].total_sum / CA[p].count` (loose; uses partition total) |
+  | MAX       | `CA[p].max_value` |
+  | MIN       | `CA[p].min_value` |
+
+  Since this prototype implements SUM only, use `CA[p].total_sum` as UB. The SUM
+  UB is the tightest and most effective for pruning.
+
 - **topKBound computation (lines 8–9):** topKBound is the K-th highest value when
   considering both exact FA aggregates and the UBs of all surviving child partitions.
   Concretely: sort the union of {FA exact values} ∪ {partition UBs} descending;
   topKBound = the K-th element.
 - **Early termination (lines 11–12):** If K groups have exact aggregates all
   exceeding topKBound, we are done. Return +infinity as the new topKBound to signal
-  completion to Algorithm 1's while loop. In practice this means: once K FA groups
-  are confirmed and all surviving partitions have UB < the K-th FA aggregate,
-  terminate.
-- **Partition ranking (lines 15–17):** If many partitions survive, rank them by
-  their UB descending so the most promising partitions are processed first in the
-  next pass. In the prototype with sequential processing, implement this ranking but
-  it mainly affects pass ordering, not correctness.
+  completion to Algorithm 1's while loop.
+- **Partition ranking (lines 15–17):** The patent gives the explicit formula.
+  When surviving partitions exceed the number of worker threads (or simply to
+  prioritise promising partitions), rank each surviving partition by its **estimated
+  per-group aggregate**:
+
+  ```
+  estimated_value_per_group[p] = CA[p].total_sum / d[p]
+  ```
+
+  where `d[p]` is the approximate distinct group count from the FM sketch stored in
+  `CA[p].approx_distinct_count`. Process partitions in descending order of this
+  estimate. In the single-threaded prototype this ordering affects pass efficiency
+  but not correctness — implement it as a sort before Pass 2 begins.
+
 - **Merging exactAggregates (lines 1–2):** partialAggregates-i contains the
   per-partition contributions to FA groups from the current pass. These must be
   merged (summed, for SUM queries) with the running exactAggregates carried over
@@ -434,6 +517,140 @@ Procedure MergeAndPrune:
   FA group g across all passes processed so far.
 - **The returned `partitions`** feeds back into Algorithm 1 line 2 as the partition
   list for the next while-loop iteration.
+
+---
+
+## 3.5 Patent-Clarified Implementation Details (US 12380098 / Application 20250103591)
+
+The following details come from the patent filing by the same authors. They are
+**additive** to the paper — they do not contradict the algorithms in Section 3, but
+fill in implementation specifics the paper leaves implicit. **The paper algorithms
+take precedence** in any case of apparent conflict.
+
+### Cache Budget Split
+
+The patent is explicit: FA and CA each receive **exactly half the total L1+L2 cache
+budget** for a given core.
+
+```
+C  = size of L1_data + L2 for one core (in units of (group_id, aggregate) pairs)
+Cf = C / 2    ← FA budget
+Cc = C / 2    ← CA budget
+```
+
+The FA table array is allocated at `2 × Cf` slots (50% load factor).
+The CA partition array holds up to `Cc` partitions.
+
+### FA Data Structure: Single-Level Hash Table with Linear Probing
+
+The patent names the FA implementation explicitly:
+
+> "The first cache resident data structure utilises a single-level hash table with
+> linear probing with a sufficiently large size to minimise collisions. A technical
+> benefit of using single-level hash tables is that this approach improves performance
+> by eliminating branching and chaining."
+
+Key implementation consequences:
+- **No chaining, no two-level structure.** A flat array of `FAEntry` with linear
+  probing only.
+- **50% load factor target** (2× array size vs. capacity) to keep probe chains short.
+- **Sentinel key** `UINT64_MAX` marks empty slots. Keep `FAEntry` at exactly 16 bytes
+  (`uint64_t` + `double`) so 4 entries fit per 64-byte cache line.
+- Hash function: use a fast integer hash (e.g., FNV-1a or multiply-shift) rather
+  than `std::hash<uint64_t>` which may not distribute well for sequential IDs.
+
+### CA: Approximate Distinct Count via Flajolet-Martin (FM)
+
+The patent names the algorithm explicitly:
+
+> "The approximate distinct count is determined using the Flajolet Martin (FM)
+> algorithm, which is used to approximate the number of unique elements in a
+> partition in one pass."
+
+The FM sketch is used in two places:
+1. **Logical/physical partitioning decision** (Algorithm 3): `d = fm.estimate()` is
+   used as the estimated distinct group count within a partition to compute `E = Cp/Q`
+   more accurately than assuming uniform distribution.
+2. **Partition ranking** (Algorithm 4): `estimated_sum_per_group = total_sum / d`
+   gives the estimated per-group contribution, used to rank surviving partitions.
+
+A minimal FM implementation for the prototype:
+```cpp
+// Use a hash function different from the partition hash to avoid correlation.
+// OR the hashed group_id into a running bitmap per partition.
+// Estimate = 2^(position of lowest 0-bit in accumulated bitmap).
+uint64_t bitmap = 0;
+// Per row routed to this partition:
+bitmap |= fm_hash(group_id);   // fm_hash returns a uint64_t with geometric
+                                // distribution of trailing zeros
+// Estimate:
+uint32_t d = 1u << __builtin_ctzll(~bitmap);  // lowest 0-bit position → estimate
+```
+
+### Sampling Tolerance Level Δ and Sample Size Formula
+
+The patent gives the closed-form sample size formula:
+
+```
+s ≥ (z_{α/2})² / (4 × Δ²)
+```
+
+Groups with true population proportion below Δ are **not guaranteed** to appear in
+the sample and are intentionally excluded from sampling-based candidate selection.
+They will still be captured in Pass 2+ via their CA partition.
+
+This is the justification for our Extension A (stratified sampling): by augmenting
+the uniform sample with targeted rows from the group index, we capture groups below
+the Δ threshold that would otherwise miss the FA candidate list.
+
+Recommended defaults: Δ=0.05, α=0.05 → s ≈ 384 (minimum). Use `max(384, 0.01×N)`
+in practice for better aggregate estimation.
+
+### Hoeffding CI for Skew Validation
+
+The patent gives the explicit CI formula used in Algorithm 2 step 3 (skew
+validation):
+
+```
+ε_i = (b_i - a_i) × sqrt( ln(2 / (1 - β)) / (2 × n'_i) )
+```
+
+where for group i in the sample:
+- `a_i` = minimum value seen for group i in the sample
+- `b_i` = maximum value seen for group i in the sample
+- `n'_i` = number of sample rows belonging to group i
+- `β` = confidence level (recommended: 0.95)
+
+Lower bound of group i's aggregate CI = `sample_aggregate_i - ε_i`
+Upper bound = `sample_aggregate_i + ε_i`
+
+In the prototype, use point estimates (ε_i = 0) with a TODO comment. Implement
+the full Hoeffding CI if time permits.
+
+### isOptimizable: Cache-Space Check, Not Group-Count Check
+
+The patent clarifies that the isOptimizable decision (Algorithm 2 line 19) operates
+on **cache space** `Cs`, not raw group count:
+
+> "If Cs > Cf, the validation fails because the cache space occupied by the grouping
+> keys exceeds the size of the cache space allocated to the FA."
+
+`Cs = |tempGroups| × sizeof(FAEntry)`. In the prototype, `sizeof(FAEntry) = 16` bytes.
+If `Cs > Cf` (i.e., too many CI-qualifying groups to fit in the FA cache), fall back
+to brute-force full aggregation.
+
+### Segment and Locality Constants (Benchmarked Values)
+
+The patent gives the concrete benchmarked values for the locality check in Algorithm 3:
+
+```
+segment_size s = 100,000 rows
+locality_threshold α₀ = 0.20
+```
+
+These were tuned on the authors' specific hardware. Use as defaults. The locality
+check itself is out of scope for this prototype (always skip to the partitioning
+decision), but record these values in code comments for completeness.
 
 ---
 
@@ -466,7 +683,6 @@ The problem is unnecessary extra passes.
 ### Extension A: Stratified Sampling via Grouping Column Index
 
 **Paper quote (Section 7):**
-
 > "Adding indexes on the groups can help perform stratified sampling to have more
 > coverage of rare groups."
 
@@ -474,7 +690,6 @@ The problem is unnecessary extra passes.
 preprocessing step before the main sampling phase.
 
 **Group Occurrence Index structure:**
-
 ```
 GroupIndex: unordered_map<group_id, vector<row_position>>
 ```
@@ -483,7 +698,6 @@ Built in one sequential scan of the dataset. Records which row positions belong 
 each group. This is the "index on grouping columns."
 
 **Stratified Sampling Algorithm:**
-
 ```
 Phase 1 (uniform): Sample s1_fraction of rows randomly → mini_aggregate → sample_counts
 Phase 2 (stratified correction):
@@ -494,11 +708,10 @@ Phase 2 (stratified correction):
             # Group is underrepresented — fetch a few of its rows from the index
             fetch min(BOOST_ROWS, GroupIndex[g].size()) rows from GroupIndex[g]
             add them to the sample aggregate for group g
-Merge Phase 1 and Phase 2 aggregates → pick top C_FA as FA candidates
+Merge Phase 1 and Phase 2 aggregates → pick top fa_capacity as FA candidates
 ```
 
 **Key design parameters (tune experimentally):**
-
 - `UNDERREP_THRESHOLD`: fraction below which a group is considered underrepresented
   (e.g., 0.5 means "if we got less than 50% of expected representation")
 - `BOOST_ROWS`: how many rows to fetch from the index for an underrepresented group
@@ -511,7 +724,6 @@ storing all row positions (can be reduced with sampling of positions).
 ### Extension B: Measure Column Index for Extreme Value Detection
 
 **Paper quote (Section 7):**
-
 > "With indexes on measure columns, we may be able to identify tuples with extreme
 > values and add the corresponding groups in the first aggregation pass to process
 > them earlier."
@@ -521,7 +733,6 @@ storing all row positions (can be reduced with sampling of positions).
 FA before normal sampling.
 
 **Measure Column Index structure:**
-
 ```
 MeasureIndex: min-heap of size m, storing (value, group_id) pairs
 ```
@@ -530,7 +741,6 @@ Built in one sequential scan. After the scan, the heap contains the m rows with
 the highest individual values.
 
 **Integration with Zippy:**
-
 ```
 Step 1: Build MeasureIndex in one pass → extract top-m group IDs (call this FORCED_SET)
 Step 2: Reserve |FORCED_SET| FA slots for FORCED_SET groups
@@ -539,7 +749,6 @@ Step 4: Run normal Zippy from Phase 1 onward
 ```
 
 **Key design parameter:**
-
 - `m`: how many extreme-value rows to look at (tune experimentally)
   - Too small: miss some rare high-value groups
   - Too large: waste FA slots on groups whose one extreme value doesn't represent
@@ -554,7 +763,7 @@ and m vs. (index build overhead). Find the knee of the curve.
 ## 5. Project Architecture
 
 ```
-zippy-optimizer/
+zippy-topk/
 ├── AGENTS.md                    ← this file
 │
 ├── src/                         ← C++ core engine
@@ -593,48 +802,88 @@ zippy-optimizer/
 ### FATable (Fine-grained Aggregates)
 
 ```cpp
+// Sentinel value for empty slots — never a valid group_id
+static constexpr uint64_t FA_EMPTY_KEY = UINT64_MAX;
+
 struct FAEntry {
-    uint64_t group_id;
-    double   exact_sum;    // for SUM queries (extend for COUNT/MAX/MIN)
-    bool     occupied;
+    uint64_t group_id;   // FA_EMPTY_KEY means slot is vacant
+    double   exact_sum;  // running exact aggregate (SUM queries)
+    // Note: no separate 'occupied' bool — use group_id == FA_EMPTY_KEY as sentinel
+    // This keeps the struct at 16 bytes, fitting 4 entries per 64-byte cache line
 };
 
 class FATable {
-    // Open-addressing hash table, fixed capacity C_FA
-    // Must fit in L2 cache: C_FA × sizeof(FAEntry) ≤ cache_budget / 2
-    std::vector<FAEntry> table;
-    size_t capacity;        // C_FA
-    size_t size;            // current number of occupied entries
+    // Single-level open-addressing hash table with linear probing.
+    // Patent explicitly specifies this design: "single-level hash table with
+    // linear probing" to eliminate branching and chaining overhead.
+    //
+    // Allocated size = 2 × capacity (50% load factor).
+    // group_ids must be masked to [0, UINT64_MAX - 1] before use.
+    std::vector<FAEntry> table;   // size = 2 * capacity
+    size_t capacity;              // Cf = C/2: number of groups FA can hold
+    size_t occupied;              // current number of non-empty entries
+
+    size_t probe(uint64_t group_id) const;  // linear probe: hash(id) % table.size()
 
 public:
+    explicit FATable(size_t capacity);
     bool   contains(uint64_t group_id) const;
-    void   insert(uint64_t group_id);            // called during candidate setup
-    void   update(uint64_t group_id, double val); // called during Pass 1
+    void   insert(uint64_t group_id);             // called during candidate setup
+    void   update(uint64_t group_id, double val); // called during Pass 1 inner loop
     double get(uint64_t group_id) const;
     std::vector<std::pair<uint64_t,double>> top_k(size_t k) const;
+    size_t size() const { return occupied; }
+    bool   full()  const { return occupied >= capacity; }
 };
 ```
 
 ### CATable (Coarse-grained Aggregates)
 
 ```cpp
+// Flajolet-Martin sketch for approximate distinct count within a partition.
+// A minimal single-pass FM sketch: maintain a bitmask of leading zeros seen
+// in hash(group_id). Estimated distinct count ≈ 2^(max_leading_zeros + 0.77).
+// For the prototype, a 64-bit trailing-zero FM sketch suffices.
+struct FMSketch {
+    uint64_t bitmap = 0;  // OR of hash(group_id) values seen
+    uint32_t estimate() const {
+        // count trailing zeros of bitmap as proxy for log2(distinct_count)
+        return bitmap == 0 ? 1 : (1u << __builtin_ctzll(~bitmap));
+    }
+    void update(uint64_t group_id) {
+        bitmap |= hash_for_fm(group_id);  // use a separate hash from partition hash
+    }
+};
+
 struct CAPartition {
-    double   total_sum;    // sum of ALL values routed to this partition
-    double   max_value;    // maximum single value seen (not group max — row max)
-    uint64_t count;        // number of rows routed here
-    bool     pruned;       // set to true after pruning step
+    double   total_sum;    // sum of ALL values routed here — UB for SUM pruning
+    double   max_value;    // max single row value — UB for MAX pruning
+    double   min_value;    // min single row value — UB for MIN pruning
+    uint64_t count;        // total row count routed here
+    FMSketch fm;           // approximate distinct group count (for partition ranking)
+    bool     pruned;       // set true after pruning step, skip in subsequent passes
+
+    // Estimated per-group aggregate (used for partition ranking in Algorithm 4)
+    // Patent formula: estimated_sum_per_group = total_sum / approx_distinct_count
+    double estimated_per_group_sum() const {
+        uint32_t d = fm.estimate();
+        return d == 0 ? total_sum : total_sum / d;
+    }
 };
 
 class CATable {
     std::vector<CAPartition> partitions;
-    size_t n_partitions;
+    size_t n_partitions;  // Q in paper notation = Cc (CA cache budget)
 
 public:
     size_t partition_of(uint64_t group_id) const;  // hash(group_id) % n_partitions
     void   update(uint64_t group_id, double val);
-    void   prune(double topKBound);                 // marks partitions as pruned
+    void   prune(double topKBound);                  // marks partitions as pruned
     std::vector<size_t> surviving_partitions() const;
-    double pruning_fraction() const;               // for metrics collection
+    // Returns surviving partitions sorted by estimated_per_group_sum() descending
+    // (Algorithm 4 partition ranking — process highest-potential partitions first)
+    std::vector<size_t> ranked_surviving_partitions() const;
+    double pruning_fraction() const;                 // for metrics collection
 };
 ```
 
@@ -701,16 +950,29 @@ Required:
 
 Algorithm selection:
   --mode <string>         One of: baseline | ext-a | ext-b | ext-ab | brute-force
-                          baseline  = Zippy with uniform sampling only
-                          ext-a     = Zippy + stratified sampling (Extension A)
-                          ext-b     = Zippy + measure index (Extension B)
-                          ext-ab    = Zippy + both extensions
+                          baseline    = Zippy with uniform sampling only
+                          ext-a       = Zippy + stratified sampling (Extension A)
+                          ext-b       = Zippy + measure index (Extension B)
+                          ext-ab      = Zippy + both extensions
                           brute-force = naive full groupby (correctness reference)
 
-Zippy parameters:
+Zippy core parameters:
+  --fa-capacity <int>     Number of groups FA hash table can hold (default: 50000)
+                          Allocated array size = 2 × fa-capacity (50% load factor)
+                          Rule of thumb: set so fa-capacity × 16 bytes ≈ L2_size / 2
+  --n-partitions <int>    Number of CA logical partitions (default: 10000)
+                          Rule of thumb: set so n-partitions × ~48 bytes ≈ L2_size / 2
   --sample-frac <float>   Uniform sample fraction (default: 0.01)
-  --fa-capacity <int>     Max entries in FA hash table (default: 50000)
-  --n-partitions <int>    Number of CA partitions (default: 10000)
+                          Actual sample size = max(ceil(z²/(4Δ²)), sample-frac × N)
+
+Sampling validation parameters:
+  --delta <float>         Sampling tolerance Δ ∈ (0,1] (default: 0.05)
+                          Groups with proportion < Δ are excluded from CI analysis
+                          Sample size formula: s ≥ (z_{α/2})² / (4 × Δ²)
+  --alpha-ci <float>      CI confidence level α for sample representativeness (default: 0.05)
+                          Controls sample size via z_{α/2} = 1.96 when α=0.05
+  --beta-ci <float>       CI confidence level β for Hoeffding skew validation (default: 0.95)
+                          Controls CI half-width: ε = (b-a)×sqrt(ln(2/(1-β))/(2n'_i))
 
 Extension A parameters:
   --underrep-threshold <float>  Fraction below expected to trigger boost (default: 0.5)
@@ -734,17 +996,21 @@ Output:
   "n_groups": 1000000,
   "top_k_results": [
     {"group_id": 42, "aggregate": 9821.5},
-    ...
+    "..."
   ],
   "metrics": {
+    "is_optimizable": true,
     "total_passes": 2,
+    "sample_size_actual": 100000,
+    "fa_candidates_count": 48731,
+    "sample_duration_ms": 22.1,
     "pass1_duration_ms": 143.2,
-    "pass2_duration_ms": 12.1,
-    "total_duration_ms": 155.3,
-    "fa_hit_rate": 0.94,
-    "partitions_pruned_pct": 0.97,
+    "pass2plus_duration_ms": 12.1,
+    "total_duration_ms": 177.4,
     "index_build_duration_ms": 88.4,
-    "sample_duration_ms": 22.1
+    "fa_hit_rate": 0.94,
+    "topKBound_after_pass1": 18432.7,
+    "partitions_pruned_pct": 0.97
   }
 }
 ```
@@ -830,14 +1096,20 @@ for gid in rare_group_ids:
 
 Every experiment run must collect these metrics for comparison across modes:
 
-| Metric                    | Description                                                    | Why It Matters                                                        |
-| ------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `fa_hit_rate`             | Fraction of true top-k groups that appear in FA after sampling | Core measure of sampling quality — our extensions should improve this |
-| `partitions_pruned_pct`   | Fraction of CA partitions pruned after Pass 1                  | Higher = less work in Pass 2+                                         |
-| `total_passes`            | Number of data passes until convergence                        | Main efficiency metric — our extensions should reduce this            |
-| `total_duration_ms`       | Wall-clock time for full query                                 | Overall performance                                                   |
-| `index_build_duration_ms` | Time to build GroupIndex / MeasureIndex                        | Extension overhead cost                                               |
-| `topKBound_after_pass1`   | Value of topKBound after the first pass                        | Higher = better pruning                                               |
+| Metric | Description | Why It Matters |
+|--------|-------------|----------------|
+| `fa_hit_rate` | Fraction of true top-k groups that appear in FA after sampling | Core measure of sampling quality — our extensions should improve this |
+| `partitions_pruned_pct` | Fraction of CA partitions pruned after Pass 1 | Higher = less work in Pass 2+ |
+| `total_passes` | Number of data passes until convergence | Main efficiency metric — our extensions should reduce this |
+| `total_duration_ms` | Wall-clock time for full query | Overall performance |
+| `sample_duration_ms` | Time for the sampling + CI validation phase | Baseline overhead of Algorithm 2 |
+| `index_build_duration_ms` | Time to build GroupIndex / MeasureIndex | Extension overhead cost |
+| `pass1_duration_ms` | Wall-clock time for Pass 1 (full data scan) | Dominant cost in most runs |
+| `pass2plus_duration_ms` | Wall-clock time for all passes after Pass 1 | Should shrink with better extensions |
+| `topKBound_after_pass1` | Value of topKBound immediately after Pass 1 pruning step | Higher = better pruning; directly shows extension impact |
+| `fa_candidates_count` | Number of groups placed in FA before Pass 1 | Sanity check: should equal min(fa_capacity, CI-qualifying groups) |
+| `is_optimizable` | Whether Zippy's skew validation passed | If false, fell back to brute-force |
+| `sample_size_actual` | Actual number of rows sampled | Should equal max(formula bound, sample_frac × N) |
 
 ---
 
@@ -848,13 +1120,13 @@ should sweep these parameters and produce one JSON result per configuration.
 
 ### Datasets
 
-| ID  | n_rows | n_groups | zipf_alpha | rare_group_fraction | rare_group_rows | rare_value_mult |
-| --- | ------ | -------- | ---------- | ------------------- | --------------- | --------------- |
-| S1  | 10M    | 1M       | 1.2        | 0.0                 | —               | —               |
-| S2  | 10M    | 1M       | 1.2        | 0.0001              | 3               | 100×            |
-| S3  | 10M    | 1M       | 1.2        | 0.001               | 3               | 100×            |
-| S4  | 50M    | 5M       | 1.2        | 0.0001              | 3               | 100×            |
-| S5  | 10M    | 1M       | 0.8        | 0.0001              | 3               | 100×            |
+| ID | n_rows | n_groups | zipf_alpha | rare_group_fraction | rare_group_rows | rare_value_mult |
+|----|--------|----------|------------|---------------------|-----------------|-----------------|
+| S1 | 10M | 1M | 1.2 | 0.0 | — | — |
+| S2 | 10M | 1M | 1.2 | 0.0001 | 3 | 100× |
+| S3 | 10M | 1M | 1.2 | 0.001 | 3 | 100× |
+| S4 | 50M | 5M | 1.2 | 0.0001 | 3 | 100× |
+| S5 | 10M | 1M | 0.8 | 0.0001 | 3 | 100× |
 
 S1 = favorable (no rare groups, baseline should do well)
 S2/S3 = adversarial (rare groups, extensions should help)
@@ -927,7 +1199,6 @@ target_include_directories(zippy PRIVATE src/)
 ```
 
 Build and run:
-
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -970,24 +1241,37 @@ def run_zippy(mode, dataset_path, n_rows, k, output_path, extra_args=None):
 Agents must preserve these invariants in all code:
 
 1. **FA never exceeds capacity.** If the sample produces more candidates than
-   `fa_capacity`, take only the top `fa_capacity` by estimated aggregate.
+   `fa_capacity`, take only the top `fa_capacity` by estimated aggregate. The
+   capacity check is on cache space `Cs = occupied × sizeof(FAEntry)`, not raw
+   group count — though in practice these are equivalent when `sizeof(FAEntry) = 16`.
 
 2. **FORCED_SET from MeasureIndex takes priority in FA.** In ext-b and ext-ab,
    the measure index groups always occupy FA slots, even if the sampler would
    have chosen different groups. Remaining slots go to sampler candidates.
 
-3. **Pruning is based on total_sum, not max_value.** `CA[p].max_value` is the
+3. **Pruning is based on `total_sum`, not `max_value`.** `CA[p].max_value` is the
    largest single row value seen in partition p, not the largest group total. Do not
-   use it as the pruning bound (it would be incorrect). Use `CA[p].total_sum`.
+   use it as the SUM pruning bound — it would be incorrect. Use `CA[p].total_sum`
+   for SUM queries. `max_value` is only the correct UB for MAX queries.
 
-4. **All values must be non-negative** for the total_sum pruning invariant to hold.
+4. **All values must be non-negative** for the `total_sum` pruning invariant to hold.
    The generator enforces this. If supporting negative values in future, the pruning
    logic must change.
 
-5. **Brute-force baseline must be single-threaded.** For fair comparison, no
+5. **FA sentinel key must never appear as a real group_id.** The value `UINT64_MAX`
+   is reserved as the empty-slot marker in the FA hash table. Mask all generated
+   group_ids to `[0, UINT64_MAX - 1]` in the data generator. The C++ Pass 1 loop
+   must assert `group_id != UINT64_MAX` in debug builds.
+
+6. **FM sketch uses a hash function independent of the partition hash.** Using the
+   same hash function for both the partition assignment and the FM sketch introduces
+   correlation that corrupts the distinct count estimate. Use two different hash
+   functions — e.g., multiply-shift with different constants.
+
+7. **Brute-force baseline must be single-threaded.** For fair comparison, no
    parallelism anywhere in this prototype.
 
-6. **Timing must exclude dataset loading from disk.** Start the clock after the data
+8. **Timing must exclude dataset loading from disk.** Start the clock after the data
    is in memory. Index build time is measured separately and added to overhead.
 
 ---
