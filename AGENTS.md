@@ -258,7 +258,7 @@ Procedure TopKAggregation:
 - The `while` loop (line 13) continues until K exact results are confirmed. In
   practice this usually terminates after 1–2 passes on skewed data.
 - The `for each partition` loop (line 14) is marked parallel in the paper. In this
-  project's prototype, **implement it sequentially** (see Section 16 — out of scope).
+  project's prototype, **implement it sequentially** (see Section 18 — out of scope).
 - `topkBound` returned by `validateAndIdentifyFAgroups` is the initial bound from
   sampling (the K-th highest lower confidence bound). It is updated each pass by
   `MergeAndPrune`.
@@ -438,7 +438,7 @@ Procedure AggregateAndPartition:
     pruned). Otherwise, physical is better because at least one child may contain
     a result-bound group.
   - In this project's prototype: **implement logical partitioning only** (see
-    Section 16). Physical partitioning (lines 29–33) is out of scope.
+    Section 18). Physical partitioning (lines 29–33) is out of scope.
 - **childPartitions-i:** These become the `partitions` list for the next pass in
   Algorithm 1. Each child partition is identified by its hash value and contains
   the CA statistics (total_sum, max_value, min_value, count, approx_distinct_count)
@@ -763,7 +763,7 @@ and m vs. (index build overhead). Find the knee of the curve.
 ## 5. Project Architecture
 
 ```
-zippy-topk/
+zippy-optimizer/
 ├── AGENTS.md                    ← this file
 │
 ├── src/                         ← C++ core engine
@@ -794,6 +794,57 @@ zippy-topk/
 ├── CMakeLists.txt               ← build configuration
 └── README.md                    ← how to build and run
 ```
+
+---
+
+## 5.1 Recommended Implementation Order
+
+An agent building this from scratch should follow this sequence. Each step is
+independently testable before moving to the next.
+
+**Phase 1 — Data layer (no algorithm yet)**
+1. `python/generate_data.py` — write and test the Zipf generator and binary writer
+2. `src/utils.h` — implement the `Row` struct, binary file reader, and timer
+3. `src/main.cpp` — wire up CLI argument parsing (use `getopt_long` or a simple
+   hand-rolled parser); read dataset into `std::vector<Row>`; confirm it loads
+4. Verify: `./build/zippy --input data/test.bin --n-rows 1000 --k 5 --mode brute-force`
+   produces correct JSON output matching `pandas groupby` in Python
+
+**Phase 2 — Brute-force baseline (correctness anchor)**
+5. `src/zippy.cpp` — implement `brute_force()`: one pass through all rows,
+   `std::unordered_map<uint64_t,double>` for exact aggregates, then `nth_element`
+   to find top-k. This is the ground-truth comparator for all other modes.
+
+**Phase 3 — Core data structures**
+6. `src/data_structures.h` — implement `FATable` (linear probing), `FMSketch`,
+   `CAPartition`, `CATable`
+7. Unit-test FATable: insert 1000 known group_ids, verify contains/update/get,
+   verify no false positives for non-inserted keys, verify top_k returns correct order
+
+**Phase 4 — Baseline Zippy (Algorithm 2 → 1 → 3 → 4)**
+8. `src/sampler.cpp` — uniform random sampler (Algorithm 2, simplified: no CI)
+9. `src/zippy.cpp` — implement `run_zippy()`:
+   - Call sampler → get FAgroups
+   - Pass 1: route rows to FA or CA (Algorithm 3, logical partitioning only)
+   - MergeAndPrune (Algorithm 4): compute topKBound, prune partitions
+   - Pass 2+: re-scan survivors until convergence (Algorithm 1 while-loop)
+10. Verify correctness on S1 dataset against brute-force output
+
+**Phase 5 — Extension A**
+11. `src/group_index.cpp` — GroupOccurrenceIndex build + query
+12. `src/stratified_sampler.cpp` — two-phase sampler using GroupIndex
+13. Wire into `src/zippy.cpp` under `--mode ext-a`
+14. Verify correctness on S2 (adversarial) dataset
+
+**Phase 6 — Extension B**
+15. `src/measure_index.cpp` — min-heap MeasureIndex
+16. Wire into `src/zippy.cpp` under `--mode ext-b`
+17. Verify correctness on S2 dataset
+
+**Phase 7 — Combined and experiments**
+18. Wire `--mode ext-ab` (both extensions)
+19. `python/run_experiments.py` — run full experiment matrix
+20. `python/plot_results.py` — produce plots
 
 ---
 
@@ -934,6 +985,103 @@ public:
 };
 ```
 
+### Hash Functions
+
+Two hash functions are needed. They must be different to avoid correlation between
+the partition assignment hash and the FM sketch hash.
+
+```cpp
+// Hash 1: Partition assignment — maps group_id to a CA partition index
+// Use multiply-shift with a fixed odd constant (good avalanche, fast)
+inline size_t partition_hash(uint64_t group_id, size_t n_partitions) {
+    // Fibonacci hashing: multiply by 2^64 / phi, take high bits
+    return (group_id * 11400714819323198485ULL) >> (64 - /* log2(n_partitions) */ 14);
+    // Safer fallback if n_partitions is not a power of 2:
+    // return (group_id * 11400714819323198485ULL) % n_partitions;
+}
+
+// Hash 2: FA lookup — maps group_id to a slot in the FA table
+inline size_t fa_hash(uint64_t group_id, size_t table_size) {
+    // Different constant — Wang hash
+    uint64_t x = group_id;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x = x ^ (x >> 31);
+    return x % table_size;
+}
+
+// Hash 3: FM sketch — must differ from both above
+inline uint64_t fm_hash(uint64_t group_id) {
+    // MurmurHash3 finalizer — produces geometrically distributed trailing zeros
+    uint64_t x = group_id;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+```
+
+**Important:** `partition_hash` and `fa_hash` must use different constants.
+`fm_hash` must differ from both. Using the same hash for FM and partitioning
+corrupts the distinct-count estimate.
+
+### Data Loading
+
+The C++ binary loads the entire dataset into memory before starting the clock.
+
+```cpp
+// In main.cpp, after argument parsing:
+std::vector<Row> dataset(n_rows);
+{
+    FILE* f = fopen(input_path.c_str(), "rb");
+    if (!f) { perror("fopen"); exit(1); }
+    size_t read = fread(dataset.data(), sizeof(Row), n_rows, f);
+    fclose(f);
+    if (read != n_rows) { fprintf(stderr, "Short read\n"); exit(1); }
+}
+// Start timing AFTER this block — file I/O excluded from benchmarks
+
+// Row struct (matches binary format exactly):
+struct Row {
+    uint64_t group_id;  // 8 bytes
+    double   value;     // 8 bytes
+};  // total: 16 bytes, no padding needed (both 8-byte aligned)
+```
+
+### PartialAggregates Structure
+
+Algorithm 3 returns `partialAggregates-i`, which is the per-pass exact aggregate
+contribution for FA groups from a specific partition. In the single-threaded
+prototype this simplifies to a single map:
+
+```cpp
+// Maps FA group_id → sum of values seen for that group in THIS pass
+// (not cumulative — merging across passes happens in Algorithm 4)
+using PartialAggregates = std::unordered_map<uint64_t, double>;
+
+// ChildPartitions: maps partition_hash → CAPartition stats accumulated this pass
+using ChildPartitions = std::unordered_map<uint64_t, CAPartition>;
+```
+
+In the multi-pass loop, `exactAggregates` is the running cumulative sum across all
+passes, while `partialAggregates` is only the current pass contribution:
+
+```cpp
+// In the main Zippy loop (Algorithm 1 / Algorithm 4):
+std::unordered_map<uint64_t, double> exactAggregates;  // cumulative, all passes
+
+// Each pass:
+PartialAggregates partial;
+ChildPartitions   children;
+aggregate_and_partition(partition, fa_groups, partial, children);
+
+// Merge (Algorithm 4 lines 1-2):
+for (auto& [gid, val] : partial)
+    exactAggregates[gid] += val;
+```
+
 ---
 
 ## 7. C++ CLI Interface
@@ -986,7 +1134,63 @@ Output:
   --verbose               Print per-pass statistics to stderr
 ```
 
-### Output JSON Format
+### Brute-Force Mode Implementation
+
+The `brute-force` mode is the correctness reference. It computes exact aggregates
+for every group in one pass, then selects the top-k. It must NOT use FA/CA.
+
+```cpp
+std::vector<std::pair<uint64_t,double>> brute_force(
+    const std::vector<Row>& dataset, size_t k)
+{
+    std::unordered_map<uint64_t, double> agg;
+    agg.reserve(dataset.size() / 10);  // rough capacity hint
+    for (const auto& row : dataset)
+        agg[row.group_id] += row.value;
+
+    // Partial sort: find top-k without fully sorting all M groups
+    std::vector<std::pair<uint64_t,double>> all(agg.begin(), agg.end());
+    std::partial_sort(all.begin(), all.begin() + k, all.end(),
+        [](const auto& a, const auto& b){ return a.second > b.second; });
+    all.resize(k);
+    return all;
+}
+```
+
+### Pass 2+ Re-scan Implementation (Logical Partitioning)
+
+With logical partitioning, surviving partitions are identified by their hash value
+but the rows are NOT physically co-located. Pass 2 therefore re-scans the **entire
+original dataset** and only processes rows whose partition hash is in the survivor
+set. This is the key cost of logical vs physical partitioning.
+
+```cpp
+// After MergeAndPrune, surviving partition hashes are known:
+std::unordered_set<uint64_t> surviving_hashes = ca.surviving_partition_hashes();
+
+// Pass 2: re-scan full dataset, aggregate only rows in surviving partitions
+std::unordered_map<uint64_t, double> pass2_agg;
+for (const auto& row : dataset) {
+    if (fa.contains(row.group_id)) {
+        // FA groups: continue accumulating (already done in pass 1, but
+        // for logical partitioning we must re-confirm their exact totals)
+        // In practice: FA exact aggregates are already complete after pass 1.
+        // Do NOT re-add them here — exactAggregates already has their totals.
+        continue;
+    }
+    uint64_t ph = partition_hash(row.group_id, n_partitions);
+    if (surviving_hashes.count(ph)) {
+        pass2_agg[row.group_id] += row.value;
+    }
+}
+// Now pass2_agg contains exact aggregates for all groups in surviving partitions.
+// Merge with exactAggregates and re-run MergeAndPrune.
+```
+
+**Note:** In subsequent passes, `partitions` refers to child partitions of the
+survivors (sub-partitions with a finer hash), not the original n_partitions
+partition scheme. Each pass re-hashes with a different modulus or a deeper hash
+to create child partitions from the survivors.
 
 ```json
 {
@@ -1057,6 +1261,8 @@ struct Row { uint64_t group_id; double value; };
 
 File: `python/generate_data.py`
 
+**Required packages:** `numpy`, `struct`
+
 Must support generating datasets with configurable properties:
 
 ```python
@@ -1064,31 +1270,124 @@ def generate_dataset(
     output_path: str,
     n_rows: int,
     n_groups: int,
-    zipf_alpha: float,      # Zipf skew. Higher = more skew. 1.0 = moderate, 2.0 = heavy
+    zipf_alpha: float,      # Zipf skew parameter (must be > 1.0). Higher = more skew.
+                            # 1.2 = moderate (matches paper's real datasets)
+                            # 2.0 = heavy skew
     value_distribution: str,  # "exponential" | "uniform" | "constant"
-    value_scale: float,     # mean/scale of value distribution
+    value_scale: float,     # mean/scale of value distribution (all values > 0)
     rare_group_fraction: float,  # fraction of groups to make "rare high-value"
     rare_group_rows: int,   # max rows per rare group (e.g., 1–5)
     rare_group_value_multiplier: float,  # rare group values = multiplier × normal values
     seed: int = 42
-) -> dict:                  # returns metadata dict (n_groups_actual, etc.)
+) -> dict:                  # returns metadata dict
+```
+
+### Correct Zipf Generation Pattern
+
+`numpy.random.Generator.zipf(alpha)` returns ranks in [1, ∞), NOT bounded group IDs.
+Map ranks to bounded group IDs using modulo:
+
+```python
+import numpy as np
+
+def generate_dataset(output_path, n_rows, n_groups, zipf_alpha,
+                     value_distribution="exponential", value_scale=100.0,
+                     rare_group_fraction=0.0, rare_group_rows=3,
+                     rare_group_value_multiplier=100.0, seed=42):
+    rng = np.random.default_rng(seed)
+
+    # Generate Zipf-distributed group IDs bounded to [0, n_groups - 1]
+    # zipf() returns ranks in [1, ∞) — subtract 1 and take modulo
+    ranks = rng.zipf(zipf_alpha, size=n_rows)
+    group_ids = ((ranks - 1) % n_groups).astype(np.uint64)
+
+    # Generate positive values
+    if value_distribution == "exponential":
+        values = rng.exponential(scale=value_scale, size=n_rows)
+    elif value_distribution == "uniform":
+        values = rng.uniform(0.0, value_scale * 2, size=n_rows)
+    elif value_distribution == "constant":
+        values = np.full(n_rows, value_scale)
+    else:
+        raise ValueError(f"Unknown value_distribution: {value_distribution}")
+
+    # Inject rare high-value groups (adversarial pattern for extensions)
+    n_rare = int(n_groups * rare_group_fraction)
+    if n_rare > 0:
+        rare_ids = np.arange(n_groups, n_groups + n_rare, dtype=np.uint64)
+        extra_group_ids = []
+        extra_values = []
+        for gid in rare_ids:
+            n_rare_rows = rng.integers(1, rare_group_rows + 1)
+            extra_group_ids.extend([gid] * n_rare_rows)
+            extra_values.extend([value_scale * rare_group_value_multiplier] * n_rare_rows)
+        group_ids = np.concatenate([group_ids,
+                                    np.array(extra_group_ids, dtype=np.uint64)])
+        values    = np.concatenate([values,
+                                    np.array(extra_values, dtype=np.float64)])
+        # Shuffle so rare groups are not all at the end
+        perm = rng.permutation(len(group_ids))
+        group_ids = group_ids[perm]
+        values    = values[perm]
+
+    # Mask group_ids to exclude UINT64_MAX (FA sentinel)
+    group_ids = np.where(group_ids == np.iinfo(np.uint64).max,
+                         np.uint64(0), group_ids)
+
+    # Write binary file: interleaved (group_id: uint64, value: float64) rows
+    # Each row = 16 bytes. Use struct.pack for correctness (no reinterpret tricks).
+    actual_n_rows = len(group_ids)
+    with open(output_path, 'wb') as f:
+        import struct
+        for gid, val in zip(group_ids, values):
+            f.write(struct.pack('<Qd', int(gid), float(val)))
+
+    # For large datasets, use the faster numpy approach:
+    # data = np.empty(actual_n_rows * 2, dtype=np.float64)
+    # data.view(np.uint64)[0::2] = group_ids   # write uint64 into float64 buffer
+    # data[1::2] = values
+    # data.tofile(output_path)
+    # Note: the view() approach works because both types are 8 bytes, but
+    # verify with: assert data.view(np.uint64)[0::2][0] == group_ids[0]
+
+    return {
+        "n_rows": actual_n_rows,
+        "n_groups_base": n_groups,
+        "n_groups_total": n_groups + n_rare,
+        "n_rare_groups": n_rare,
+        "zipf_alpha": zipf_alpha,
+        "output_path": output_path,
+    }
 ```
 
 ### Generating Rare High-Value Groups
 
-The key adversarial pattern to generate:
+The key adversarial pattern is already embedded above. The rare groups:
+- Have IDs in `[n_groups, n_groups + n_rare)` — distinct from normal groups
+- Have only 1–`rare_group_rows` rows each — almost never sampled uniformly
+- Have values = `value_scale × rare_group_value_multiplier` — high enough to
+  appear in true top-k despite low frequency
+- Are shuffled into the dataset randomly so they cannot be found by position
+
+### How to Compute `fa_hit_rate`
+
+`fa_hit_rate` requires knowing (a) which groups were in FA after sampling, and
+(b) which groups are in the true top-k. The C++ binary must emit the FA group IDs
+in the output JSON. The Python driver then computes:
 
 ```python
-# After generating the main Zipf-distributed dataset:
-n_rare = int(n_groups * rare_group_fraction)
-rare_group_ids = range(n_groups, n_groups + n_rare)  # new group IDs
+def compute_fa_hit_rate(zippy_result, brute_force_result, k):
+    true_topk = set(r["group_id"] for r in brute_force_result[:k])
+    fa_groups  = set(zippy_result.get("fa_group_ids", []))
+    hits = true_topk & fa_groups
+    return len(hits) / k
 
-for gid in rare_group_ids:
-    n_rows_for_group = random.randint(1, rare_group_rows)
-    rare_values = value_scale * rare_group_value_multiplier * np.ones(n_rows_for_group)
-    # append (gid, rare_value) rows to dataset
-    # these groups have very few rows but high values — the adversarial case
+# The C++ binary must include in JSON output:
+# "fa_group_ids": [42, 1337, 9999, ...]  ← list of group_ids placed in FA
 ```
+
+Add `--output-fa-groups` flag to the C++ CLI to enable this output (it adds
+overhead and should be off by default in timing runs).
 
 ---
 
@@ -1113,7 +1412,109 @@ Every experiment run must collect these metrics for comparison across modes:
 
 ---
 
-## 11. Experiment Matrix
+## 11. Python Experiment Driver and Plotting Spec
+
+### `python/run_experiments.py`
+
+**Required packages:** `subprocess`, `json`, `pathlib`, `itertools`, `pandas`
+
+The driver's outer structure:
+
+```python
+import subprocess, json, itertools
+from pathlib import Path
+
+DATASETS = [
+    {"id": "S1", "n_rows": 10_000_000, "n_groups": 1_000_000,
+     "zipf_alpha": 1.2, "rare_group_fraction": 0.0},
+    {"id": "S2", "n_rows": 10_000_000, "n_groups": 1_000_000,
+     "zipf_alpha": 1.2, "rare_group_fraction": 0.0001,
+     "rare_group_rows": 3, "rare_group_value_multiplier": 100},
+    {"id": "S3", "n_rows": 10_000_000, "n_groups": 1_000_000,
+     "zipf_alpha": 1.2, "rare_group_fraction": 0.001,
+     "rare_group_rows": 3, "rare_group_value_multiplier": 100},
+    {"id": "S4", "n_rows": 50_000_000, "n_groups": 5_000_000,
+     "zipf_alpha": 1.2, "rare_group_fraction": 0.0001,
+     "rare_group_rows": 3, "rare_group_value_multiplier": 100},
+    {"id": "S5", "n_rows": 10_000_000, "n_groups": 1_000_000,
+     "zipf_alpha": 0.8, "rare_group_fraction": 0.0001,
+     "rare_group_rows": 3, "rare_group_value_multiplier": 100},
+]
+MODES = ["brute-force", "baseline", "ext-a", "ext-b", "ext-ab"]
+K = 50
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+def run_zippy(mode, dataset_meta, k, extra_args=None):
+    ds = dataset_meta
+    output_path = RESULTS_DIR / f"{ds['id']}_{mode}_k{k}.json"
+    cmd = ["./build/zippy",
+           "--input",   f"data/{ds['id']}.bin",
+           "--n-rows",  str(ds["n_rows"]),
+           "--k",       str(k),
+           "--mode",    mode,
+           "--output",  str(output_path)]
+    if extra_args:
+        cmd.extend(extra_args)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"[{mode}/{ds['id']}] Failed:\n{r.stderr}")
+    return json.loads(output_path.read_text())
+
+# Main experiment loop
+all_results = []
+for ds in DATASETS:
+    for mode in MODES:
+        result = run_zippy(mode, ds, K)
+        result["dataset"] = ds["id"]
+        all_results.append(result)
+
+# Parameter sweeps (on S2 only)
+s2 = next(d for d in DATASETS if d["id"] == "S2")
+for m in [50, 100, 250, 500, 1000, 2500, 5000]:
+    result = run_zippy("ext-b", s2, K, ["--measure-m", str(m)])
+    result["sweep"] = "measure_m"; result["sweep_val"] = m
+    all_results.append(result)
+
+for thresh in [0.1, 0.25, 0.5, 0.75, 1.0]:
+    result = run_zippy("ext-a", s2, K, ["--underrep-threshold", str(thresh)])
+    result["sweep"] = "underrep_threshold"; result["sweep_val"] = thresh
+    all_results.append(result)
+
+for k_val in [1, 5, 10, 25, 50, 100]:
+    for mode in ["baseline", "ext-ab"]:
+        result = run_zippy(mode, s2, k_val)
+        result["sweep"] = "k"; result["sweep_val"] = k_val
+        all_results.append(result)
+
+import json
+Path("results/all_results.json").write_text(json.dumps(all_results, indent=2))
+```
+
+### `python/plot_results.py`
+
+**Required packages:** `matplotlib`, `pandas`, `json`
+
+Produce these plots (save as PNG to `plots/` directory):
+
+| Plot filename | X-axis | Y-axis | Series | Dataset |
+|---|---|---|---|---|
+| `fa_hit_rate_by_mode.png` | Dataset (S1–S5) | fa_hit_rate | mode | all |
+| `passes_by_mode.png` | Dataset (S1–S5) | total_passes | mode | all |
+| `duration_by_mode.png` | Dataset (S1–S5) | total_duration_ms | mode | all |
+| `pruned_pct_by_mode.png` | Dataset (S1–S5) | partitions_pruned_pct | mode | all |
+| `sweep_m_passes.png` | measure_m | total_passes | — | S2 |
+| `sweep_m_duration.png` | measure_m | total_duration_ms + index_build_duration_ms | — | S2 |
+| `sweep_threshold_hits.png` | underrep_threshold | fa_hit_rate | — | S2 |
+| `sweep_k_passes.png` | k | total_passes | baseline vs ext-ab | S2 |
+| `topkbound_comparison.png` | Dataset (S2, S3) | topKBound_after_pass1 | mode | S2,S3 |
+
+All bar charts use the mode as colour legend. All line charts use markers.
+Title each plot clearly. Save at 150 DPI.
+
+---
+
+## 12. Experiment Matrix
 
 Run all experiments across this matrix. The Python driver (`run_experiments.py`)
 should sweep these parameters and produce one JSON result per configuration.
@@ -1152,7 +1553,7 @@ k ∈ {1, 5, 10, 25, 50, 100} with mode=baseline and ext-ab, dataset=S2
 
 ---
 
-## 12. Correctness Verification
+## 13. Correctness Verification
 
 **Rule:** The top-k result from any mode must exactly match the brute-force result
 for every experiment. Verify this in `python/verify_correctness.py`.
@@ -1174,7 +1575,48 @@ Always run correctness verification on S1–S3 before running the full experimen
 
 ---
 
-## 13. Build System
+## 14. Dependencies
+
+### C++ (no external libraries required beyond the standard library)
+
+All C++ code uses only the C++17 standard library. No third-party dependencies.
+
+Required headers:
+```cpp
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>      // std::partial_sort, std::sort, std::nth_element
+#include <queue>          // std::priority_queue (MeasureIndex)
+#include <cstdint>        // uint64_t, UINT64_MAX
+#include <cmath>          // std::sqrt, std::log
+#include <cstdio>         // fread, fopen, fclose
+#include <cstring>        // memset
+#include <chrono>         // high_resolution_clock (timing)
+#include <string>
+#include <cassert>
+#include <cstdlib>        // getopt / argument parsing
+// JSON output: write by hand (sprintf/fprintf) — no JSON library needed
+// The output JSON is simple enough to write directly without a library
+```
+
+Compiler: `g++ -std=c++17 -O3 -march=native` or `clang++ -std=c++17 -O3`
+
+### Python
+
+```
+numpy>=1.24          # data generation, file I/O
+matplotlib>=3.7      # plotting
+pandas>=2.0          # result aggregation in run_experiments.py
+```
+
+Install: `pip install numpy matplotlib pandas`
+
+No other Python dependencies. The C++ binary is called via `subprocess`.
+
+---
+
+## 15. Build System
 
 Use CMake with C++17. Optimize for performance (`-O3`).
 
@@ -1209,7 +1651,7 @@ cd ..
 
 ---
 
-## 14. Python Driver Interface
+## 16. Python Driver Interface
 
 `python/run_experiments.py` calls the C++ binary via subprocess:
 
@@ -1236,7 +1678,7 @@ def run_zippy(mode, dataset_path, n_rows, k, output_path, extra_args=None):
 
 ---
 
-## 15. Key Invariants and Edge Cases
+## 17. Key Invariants and Edge Cases
 
 Agents must preserve these invariants in all code:
 
@@ -1276,7 +1718,7 @@ Agents must preserve these invariants in all code:
 
 ---
 
-## 16. What NOT to Implement (Scope Boundaries)
+## 18. What NOT to Implement (Scope Boundaries)
 
 The following are described in the paper but are out of scope for this project:
 
@@ -1292,7 +1734,7 @@ The following are described in the paper but are out of scope for this project:
 
 ---
 
-## 17. Summary of What We Are Contributing
+## 19. Summary of What We Are Contributing
 
 The paper's Section 7 lists both extensions as future work with no implementation
 or evaluation. This project:
