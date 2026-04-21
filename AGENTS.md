@@ -991,13 +991,11 @@ Two hash functions are needed. They must be different to avoid correlation betwe
 the partition assignment hash and the FM sketch hash.
 
 ```cpp
-// Hash 1: Partition assignment — maps group_id to a CA partition index
-// Use multiply-shift with a fixed odd constant (good avalanche, fast)
+// Hash 1: Partition assignment — maps group_id to a CA partition index.
+// Always uses modulo so it works for any n_partitions value (not just powers of 2).
 inline size_t partition_hash(uint64_t group_id, size_t n_partitions) {
-    // Fibonacci hashing: multiply by 2^64 / phi, take high bits
-    return (group_id * 11400714819323198485ULL) >> (64 - /* log2(n_partitions) */ 14);
-    // Safer fallback if n_partitions is not a power of 2:
-    // return (group_id * 11400714819323198485ULL) % n_partitions;
+    // Fibonacci hashing with modulo fallback — correct for any n_partitions
+    return (group_id * 11400714819323198485ULL) % n_partitions;
 }
 
 // Hash 2: FA lookup — maps group_id to a slot in the FA table
@@ -1020,6 +1018,15 @@ inline uint64_t fm_hash(uint64_t group_id) {
     x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 33;
     return x;
+}
+
+// Hash 4: Child partition assignment in Pass 2+ — must differ from Hash 1
+// so that child partitions subdivide parent partitions differently each pass.
+// Pass number is mixed in to produce a different hash per pass.
+inline size_t child_partition_hash(uint64_t group_id, size_t n_child_partitions,
+                                    int pass_number) {
+    uint64_t mixed = group_id ^ (static_cast<uint64_t>(pass_number) * 2654435761ULL);
+    return (mixed * 6364136223846793005ULL) % n_child_partitions;
 }
 ```
 
@@ -1082,6 +1089,368 @@ for (auto& [gid, val] : partial)
     exactAggregates[gid] += val;
 ```
 
+### `utils.h` — Timer and JSON Writer
+
+```cpp
+#pragma once
+#include <chrono>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdint>
+
+// ── Timer ──────────────────────────────────────────────────────────────────
+struct Timer {
+    using Clock = std::chrono::high_resolution_clock;
+    std::chrono::time_point<Clock> start_;
+
+    void   reset() { start_ = Clock::now(); }
+    double elapsed_ms() const {
+        auto end = Clock::now();
+        return std::chrono::duration<double, std::milli>(end - start_).count();
+    }
+};
+
+// ── Metrics collected per run ──────────────────────────────────────────────
+struct RunMetrics {
+    bool   is_optimizable       = true;
+    int    total_passes         = 0;
+    size_t sample_size_actual   = 0;
+    size_t fa_candidates_count  = 0;
+    double sample_duration_ms   = 0;
+    double pass1_duration_ms    = 0;
+    double pass2plus_duration_ms= 0;
+    double total_duration_ms    = 0;
+    double index_build_duration_ms = 0;
+    double fa_hit_rate          = -1;   // -1 = not computed (needs --output-fa-groups)
+    double topKBound_after_pass1= 0;
+    double partitions_pruned_pct= 0;
+};
+
+// ── JSON writer (no external library) ─────────────────────────────────────
+// Write the output JSON to `path`. All strings are plain ASCII — no escaping needed.
+inline void write_output_json(
+    const std::string& path,
+    const std::string& mode,
+    int k, size_t n_rows, size_t n_groups,
+    const std::vector<std::pair<uint64_t,double>>& top_k_results,
+    const RunMetrics& m,
+    const std::vector<uint64_t>& fa_group_ids,   // empty if --output-fa-groups not set
+    bool output_fa_groups)
+{
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) { perror("fopen output"); return; }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"mode\": \"%s\",\n", mode.c_str());
+    fprintf(f, "  \"k\": %d,\n", k);
+    fprintf(f, "  \"n_rows\": %zu,\n", n_rows);
+    fprintf(f, "  \"n_groups\": %zu,\n", n_groups);
+
+    fprintf(f, "  \"top_k_results\": [\n");
+    for (size_t i = 0; i < top_k_results.size(); ++i) {
+        fprintf(f, "    {\"group_id\": %llu, \"aggregate\": %.6f}%s\n",
+                (unsigned long long)top_k_results[i].first,
+                top_k_results[i].second,
+                i + 1 < top_k_results.size() ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+
+    if (output_fa_groups && !fa_group_ids.empty()) {
+        fprintf(f, "  \"fa_group_ids\": [");
+        for (size_t i = 0; i < fa_group_ids.size(); ++i)
+            fprintf(f, "%llu%s", (unsigned long long)fa_group_ids[i],
+                    i + 1 < fa_group_ids.size() ? "," : "");
+        fprintf(f, "],\n");
+    }
+
+    fprintf(f, "  \"metrics\": {\n");
+    fprintf(f, "    \"is_optimizable\": %s,\n", m.is_optimizable ? "true" : "false");
+    fprintf(f, "    \"total_passes\": %d,\n", m.total_passes);
+    fprintf(f, "    \"sample_size_actual\": %zu,\n", m.sample_size_actual);
+    fprintf(f, "    \"fa_candidates_count\": %zu,\n", m.fa_candidates_count);
+    fprintf(f, "    \"sample_duration_ms\": %.3f,\n", m.sample_duration_ms);
+    fprintf(f, "    \"pass1_duration_ms\": %.3f,\n", m.pass1_duration_ms);
+    fprintf(f, "    \"pass2plus_duration_ms\": %.3f,\n", m.pass2plus_duration_ms);
+    fprintf(f, "    \"total_duration_ms\": %.3f,\n", m.total_duration_ms);
+    fprintf(f, "    \"index_build_duration_ms\": %.3f,\n", m.index_build_duration_ms);
+    fprintf(f, "    \"fa_hit_rate\": %.6f,\n", m.fa_hit_rate);
+    fprintf(f, "    \"topKBound_after_pass1\": %.6f,\n", m.topKBound_after_pass1);
+    fprintf(f, "    \"partitions_pruned_pct\": %.6f\n", m.partitions_pruned_pct);
+    fprintf(f, "  }\n}\n");
+    fclose(f);
+}
+```
+
+### `zippy.h` — Public Interface of the Core Engine
+
+```cpp
+#pragma once
+#include "data_structures.h"
+#include "utils.h"
+#include <vector>
+#include <string>
+#include <unordered_set>
+
+struct ZippyConfig {
+    size_t fa_capacity      = 50000;   // groups FA can hold
+    size_t n_partitions     = 10000;   // CA logical partition count
+    double sample_frac      = 0.01;    // uniform sample fraction
+    double delta            = 0.05;    // sampling tolerance Δ
+    double alpha_ci         = 0.05;    // CI confidence for sample size
+    double beta_ci          = 0.95;    // Hoeffding CI confidence
+    // Extension A
+    double underrep_threshold = 0.5;
+    size_t boost_rows         = 10;
+    // Extension B
+    size_t measure_m          = 500;
+    // Output
+    bool   output_fa_groups   = false;
+    bool   verbose            = false;
+};
+
+// Baseline Zippy (uniform sampling, logical partitioning, SUM only)
+RunMetrics run_zippy_baseline(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
+// Extension A: stratified sampling via GroupOccurrenceIndex
+RunMetrics run_zippy_ext_a(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
+// Extension B: measure column index for extreme value detection
+RunMetrics run_zippy_ext_b(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
+// Extensions A + B combined
+RunMetrics run_zippy_ext_ab(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
+// Brute-force reference (always correct, used for verification)
+std::vector<std::pair<uint64_t,double>> run_brute_force(
+    const std::vector<Row>& dataset, int k);
+```
+
+### `sampler.h` — Uniform Random Sampler Interface
+
+```cpp
+#pragma once
+#include "data_structures.h"
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+
+// Per-group statistics accumulated during sampling
+struct SampleGroupStats {
+    double   sum   = 0;
+    double   count = 0;
+    double   min_val = std::numeric_limits<double>::max();
+    double   max_val = std::numeric_limits<double>::lowest();
+};
+
+// Result of the sampling + skew validation phase (Algorithm 2)
+struct SampleResult {
+    bool is_optimizable = true;
+    std::unordered_set<uint64_t> fa_groups;   // group_ids selected for FA
+    std::unordered_map<uint64_t, SampleGroupStats> sample_stats;  // for CI/debug
+    size_t sample_size_actual = 0;
+};
+
+// Perform uniform random sampling and FA group selection (Algorithm 2, simplified)
+// Uses point estimates (no full Hoeffding CI). Selects top fa_capacity groups by
+// sample aggregate, then fills remaining slots with heavy hitters.
+SampleResult uniform_sample_and_select(
+    const std::vector<Row>& dataset,
+    size_t fa_capacity,
+    double sample_frac,
+    double delta,
+    double alpha_ci,
+    double beta_ci,
+    uint64_t seed = 42);
+```
+
+### `main.cpp` Structure — How Everything Wires Together
+
+```cpp
+#include "zippy.h"
+#include "utils.h"
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+
+int main(int argc, char* argv[]) {
+    // 1. Parse arguments (hand-rolled — no getopt dependency)
+    std::string input_path, output_path, mode = "baseline";
+    int k = 50;
+    size_t n_rows = 0;
+    ZippyConfig cfg;
+    bool output_fa_groups = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if      (!strcmp(argv[i], "--input"))        input_path  = argv[++i];
+        else if (!strcmp(argv[i], "--output"))       output_path = argv[++i];
+        else if (!strcmp(argv[i], "--mode"))         mode        = argv[++i];
+        else if (!strcmp(argv[i], "--n-rows"))       n_rows      = std::stoull(argv[++i]);
+        else if (!strcmp(argv[i], "--k"))            k           = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fa-capacity"))  cfg.fa_capacity   = std::stoull(argv[++i]);
+        else if (!strcmp(argv[i], "--n-partitions")) cfg.n_partitions  = std::stoull(argv[++i]);
+        else if (!strcmp(argv[i], "--sample-frac"))  cfg.sample_frac   = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--delta"))        cfg.delta         = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--alpha-ci"))     cfg.alpha_ci      = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--beta-ci"))      cfg.beta_ci       = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--underrep-threshold")) cfg.underrep_threshold = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--boost-rows"))   cfg.boost_rows    = std::stoull(argv[++i]);
+        else if (!strcmp(argv[i], "--measure-m"))    cfg.measure_m     = std::stoull(argv[++i]);
+        else if (!strcmp(argv[i], "--output-fa-groups")) output_fa_groups = true;
+        else if (!strcmp(argv[i], "--verbose"))      cfg.verbose = true;
+    }
+    if (input_path.empty() || output_path.empty() || n_rows == 0) {
+        fprintf(stderr, "Usage: zippy --input <path> --n-rows <N> --k <k> "
+                        "--mode <mode> --output <path> [options]\n");
+        return 1;
+    }
+
+    // 2. Load dataset (timing excluded)
+    std::vector<Row> dataset(n_rows);
+    {
+        FILE* f = fopen(input_path.c_str(), "rb");
+        if (!f) { perror("fopen"); return 1; }
+        if (fread(dataset.data(), sizeof(Row), n_rows, f) != n_rows) {
+            fprintf(stderr, "Short read from %s\n", input_path.c_str());
+            return 1;
+        }
+        fclose(f);
+    }
+
+    // 3. Dispatch to the appropriate mode
+    std::vector<std::pair<uint64_t,double>> results;
+    std::vector<uint64_t> fa_groups;
+    RunMetrics metrics;
+    cfg.output_fa_groups = output_fa_groups;
+
+    Timer total_timer; total_timer.reset();
+
+    if (mode == "brute-force") {
+        results = run_brute_force(dataset, k);
+        metrics.total_duration_ms = total_timer.elapsed_ms();
+        metrics.is_optimizable    = true;   // brute-force always "works"
+    } else if (mode == "baseline") {
+        metrics = run_zippy_baseline(dataset, k, cfg, results, fa_groups);
+    } else if (mode == "ext-a") {
+        metrics = run_zippy_ext_a(dataset, k, cfg, results, fa_groups);
+    } else if (mode == "ext-b") {
+        metrics = run_zippy_ext_b(dataset, k, cfg, results, fa_groups);
+    } else if (mode == "ext-ab") {
+        metrics = run_zippy_ext_ab(dataset, k, cfg, results, fa_groups);
+    } else {
+        fprintf(stderr, "Unknown mode: %s\n", mode.c_str());
+        return 1;
+    }
+
+    // 4. Write output JSON
+    write_output_json(output_path, mode, k, n_rows,
+                      /* n_groups estimate */ 0,  // fill in from sampler if available
+                      results, metrics, fa_groups, output_fa_groups);
+    return 0;
+}
+```
+
+### `CATable::update()` — Full Implementation Body
+
+The `update()` method is the hot path called for every non-FA row in Pass 1. It must update all five fields of `CAPartition`:
+
+```cpp
+void CATable::update(uint64_t group_id, double val) {
+    size_t p = partition_of(group_id);          // partition_hash(group_id, n_partitions)
+    CAPartition& part = partitions[p];
+    part.total_sum += val;
+    if (val > part.max_value) part.max_value = val;
+    if (val < part.min_value) part.min_value = val;
+    part.count++;
+    part.fm.update(group_id);                   // FM sketch update (uses fm_hash)
+}
+
+// Initialise CAPartition to safe defaults (call in CATable constructor):
+CAPartition zero_partition() {
+    return {
+        .total_sum = 0.0,
+        .max_value = std::numeric_limits<double>::lowest(),
+        .min_value = std::numeric_limits<double>::max(),
+        .count     = 0,
+        .fm        = FMSketch{},
+        .pruned    = false
+    };
+}
+```
+
+### Multi-Pass Child Partitioning — How Pass 3+ Works
+
+On Pass 2+, each surviving partition is re-partitioned into child partitions using `child_partition_hash()` with the current pass number mixed in. The child partition count should be roughly `n_partitions` again — surviving partitions are divided, not the whole dataset:
+
+```
+Pass 1: route all N rows → n_partitions CA buckets using partition_hash(gid, n_partitions)
+        → prune → survivors: {p3, p7, p12, ...}
+
+Pass 2: for each surviving partition pX:
+          re-scan full dataset, filter rows where partition_hash(gid, n_partitions) == pX
+          re-route those rows → child_partition_hash(gid, n_child, pass=2) child buckets
+          → prune child buckets → survivors carried to Pass 3
+
+Pass 3: repeat on surviving child buckets, now pass=3 in child_partition_hash
+        → each generation of partitions is finer-grained
+```
+
+In the single-threaded prototype, "filter rows for partition pX" means a full re-scan of the original dataset each pass. The child partition count is controlled by `n_partitions` (same constant). Each pass, fewer rows remain unresolved, so passes get progressively cheaper:
+
+```cpp
+// Simplified multi-pass loop skeleton in run_zippy_baseline():
+int pass = 1;
+std::unordered_set<size_t> active_partitions;  // initially: all n_partitions
+
+while (top_k_confirmed < k && !active_partitions.empty()) {
+    PartialAggregates partial;
+    ChildPartitions   children;
+
+    for (const auto& row : dataset) {
+        if (fa.contains(row.group_id)) {
+            partial[row.group_id] += row.value;
+            continue;
+        }
+        size_t p;
+        if (pass == 1)
+            p = partition_hash(row.group_id, n_partitions);
+        else
+            p = child_partition_hash(row.group_id, n_partitions, pass);
+
+        if (active_partitions.count(p))
+            children[p].update_from_row(row);  // update stats + FM sketch
+    }
+
+    // Merge + Prune (Algorithm 4)
+    for (auto& [gid, val] : partial)
+        exactAggregates[gid] += val;
+
+    double topKBound = compute_topkbound(exactAggregates, children, k);
+    active_partitions = prune_partitions(children, topKBound);
+    pass++;
+}
+```
+
 ---
 
 ## 7. C++ CLI Interface
@@ -1132,6 +1501,8 @@ Extension B parameters:
 Output:
   --output <path>         Path to write JSON results file
   --verbose               Print per-pass statistics to stderr
+  --output-fa-groups      Include FA group ID list in JSON output (for fa_hit_rate
+                          computation). Adds overhead — disable for timing runs.
 ```
 
 ### Brute-Force Mode Implementation
@@ -1231,21 +1602,26 @@ Binary format for maximum I/O speed. Each row is 16 bytes:
 
 Rows are stored contiguously. No header. Total file size = n_rows × 16 bytes.
 
-The Python generator writes this format:
+The Python generator writes this format (little-endian, no padding):
 
 ```python
-import numpy as np
 import struct
 
 def write_dataset(path, group_ids, values):
     """
     group_ids: np.ndarray of uint64
     values:    np.ndarray of float64
+    Writes interleaved (group_id, value) pairs, 16 bytes per row, little-endian.
     """
-    data = np.empty(len(group_ids) * 2, dtype=np.float64)
-    data[0::2] = group_ids.view(np.float64)  # reinterpret cast
-    data[1::2] = values
-    data.tofile(path)
+    with open(path, 'wb') as f:
+        for gid, val in zip(group_ids, values):
+            f.write(struct.pack('<Qd', int(gid), float(val)))
+    # For large datasets (>1M rows), use the faster vectorised approach:
+    # import numpy as np
+    # buf = np.empty(len(group_ids) * 2, dtype=np.float64)
+    # buf.view(np.uint64)[0::2] = group_ids   # safe: same byte width
+    # buf[1::2] = values
+    # buf.tofile(path)
 ```
 
 The C++ reader reads it as:
@@ -1556,22 +1932,78 @@ k ∈ {1, 5, 10, 25, 50, 100} with mode=baseline and ext-ab, dataset=S2
 ## 13. Correctness Verification
 
 **Rule:** The top-k result from any mode must exactly match the brute-force result
-for every experiment. Verify this in `python/verify_correctness.py`.
+for every experiment. This is checked in `python/verify_correctness.py`.
+
+The set of top-k group IDs must be identical — order does not matter since ranks
+within top-k can vary for equal aggregates, but the *set* must be the same.
 
 ```python
-def verify(brute_force_result, zippy_result, k):
-    bf_groups = [r["group_id"] for r in brute_force_result[:k]]
-    zy_groups = [r["group_id"] for r in zippy_result[:k]]
-    assert set(bf_groups) == set(zy_groups), (
-        f"Correctness failure!\n"
-        f"Brute-force top-k: {bf_groups}\n"
-        f"Zippy top-k:       {zy_groups}\n"
-        f"Missing: {set(bf_groups) - set(zy_groups)}\n"
-        f"Extra:   {set(zy_groups) - set(bf_groups)}"
-    )
+#!/usr/bin/env python3
+"""
+python/verify_correctness.py
+
+Runs baseline, ext-a, ext-b, ext-ab against brute-force on datasets S1, S2, S3
+and verifies correctness of all modes.
+
+Usage: python verify_correctness.py
+Prerequisite: build/zippy is compiled, data/S1.bin, data/S2.bin, data/S3.bin exist.
+"""
+import subprocess, json, sys
+from pathlib import Path
+
+BINARY  = "./build/zippy"
+DATA_DIR = Path("data")
+RESULTS  = Path("results/correctness")
+RESULTS.mkdir(parents=True, exist_ok=True)
+
+DATASETS = [
+    {"id": "S1", "n_rows": 10_000_000},
+    {"id": "S2", "n_rows": 10_000_000},
+    {"id": "S3", "n_rows": 10_000_000},
+]
+MODES = ["baseline", "ext-a", "ext-b", "ext-ab"]
+K = 50
+
+def run(mode, ds_id, n_rows, extra=None):
+    out = RESULTS / f"{ds_id}_{mode}.json"
+    cmd = [BINARY, "--input", str(DATA_DIR / f"{ds_id}.bin"),
+           "--n-rows", str(n_rows), "--k", str(K),
+           "--mode", mode, "--output", str(out)]
+    if extra: cmd.extend(extra)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"[{mode}/{ds_id}] FAILED:\n{r.stderr}")
+    return json.loads(out.read_text())
+
+def top_k_set(result):
+    return set(r["group_id"] for r in result["top_k_results"])
+
+failures = 0
+for ds in DATASETS:
+    print(f"\n=== Dataset {ds['id']} ===")
+    bf = run("brute-force", ds["id"], ds["n_rows"])
+    bf_set = top_k_set(bf)
+    print(f"  brute-force top-{K}: {sorted(bf_set)[:5]}...")
+
+    for mode in MODES:
+        result = run(mode, ds["id"], ds["n_rows"])
+        got_set = top_k_set(result)
+        passes  = result["metrics"]["total_passes"]
+        pruned  = result["metrics"]["partitions_pruned_pct"]
+
+        if got_set == bf_set:
+            print(f"  ✓ {mode:12s}  passes={passes}  pruned={pruned:.1%}")
+        else:
+            print(f"  ✗ {mode:12s}  CORRECTNESS FAILURE")
+            print(f"    Missing from result : {bf_set - got_set}")
+            print(f"    Extra in result     : {got_set - bf_set}")
+            failures += 1
+
+print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILURES'}")
+sys.exit(0 if failures == 0 else 1)
 ```
 
-Always run correctness verification on S1–S3 before running the full experiment matrix.
+Always run this before the full experiment matrix. If any failure occurs, do not proceed to benchmarking.
 
 ---
 
