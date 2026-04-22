@@ -95,7 +95,7 @@ This is the most robust mode — it handles both rare-group and extreme-value ad
 zippy-optimizer/
 ├── src/                          C++ core engine
 │   ├── main.cpp                  CLI entry point, argument parsing, data loading
-│   ├── zippy.h / zippy.cpp       Zippy algorithm (brute-force baseline implemented)
+│   ├── zippy.h / zippy.cpp       Zippy algorithm (baseline implemented through Phase 4C)
 │   ├── data_structures.h         FATable, CATable, FMSketch, hash functions
 │   ├── sampler.h / sampler.cpp   Uniform random sampler (Phase 4)
 │   ├── group_index.h / .cpp      Extension A: GroupOccurrenceIndex (Phase 5)
@@ -108,6 +108,7 @@ zippy-optimizer/
 │   ├── generate_data.py          Synthetic dataset generator (Zipf + rare groups)
 │   ├── run_experiments.py        Parameter sweeps, calls C++ binary (Phase 8)
 │   ├── plot_results.py           Matplotlib plots for results (Phase 8)
+│   ├── compare_phase4c_results.py Compare baseline vs brute-force outputs (Phase 4C)
 │   ├── verify_correctness.py     Checks all modes match brute-force (Phase 7)
 │   └── verify_phase2.py          Cross-checks brute-force vs Python pandas
 │
@@ -169,8 +170,7 @@ pip install numpy matplotlib pandas
 
 **Using g++ directly (simplest):**
 ```bash
-g++ -std=c++17 -O2 -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp \
-    src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+g++ -std=c++17 -O2 -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
 ```
 
 **Using CMake:**
@@ -243,6 +243,34 @@ g++ -std=c++17 -O2 -o build/test_phase4b src/test_phase4b.cpp src/zippy.cpp src/
 g++ -std=c++17 -O2 -o build/test_phase4c src/test_phase4c.cpp src/zippy.cpp src/sampler.cpp -Isrc/
 ./build/test_phase4c --input data/S0.bin --n-rows 10089 --k 10
 ```
+
+### 9. Full baseline validation workflow (S0 + S1)
+
+Use this when you want to confirm the full Phase 4C baseline behavior end-to-end.
+
+```bash
+# 1) Build zippy
+g++ -std=c++17 -O2 -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+
+# 2) Ensure S0 and S1 exist (S1 may take some time to generate)
+python python/generate_data.py --output data/S0.bin --n-rows 10000 --n-groups 500 --zipf-alpha 1.2 --rare-group-fraction 0.1 --rare-group-rows 3 --rare-group-value-multiplier 100
+python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups 1000000 --zipf-alpha 1.2 --rare-group-fraction 0.0
+
+# 3) Run brute-force and baseline on S0
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --output results/S0_baseline.json
+
+# 4) Run brute-force and baseline on S1
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode brute-force --output results/S1_bf.json
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
+
+# 5) Compare top-k ID sets + print baseline metrics
+python python/compare_phase4c_results.py
+```
+
+Expected outcome for Phase 4C baseline:
+- S0 and S1 top-k ID sets match brute-force exactly.
+- S1 should typically converge in ~1–2 passes with high pruning on skewed data.
 
 ---
 
