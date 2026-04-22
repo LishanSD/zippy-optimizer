@@ -1,5 +1,5 @@
 {
-  "mode": "brute-force",
+  "mode": "baseline",
   "k": 10,
   "n_rows": 10089,
   "n_groups": 0,
@@ -17,16 +17,16 @@
   ],
   "metrics": {
     "is_optimizable": true,
-    "total_passes": 0,
-    "sample_size_actual": 0,
-    "fa_candidates_count": 0,
-    "sample_duration_ms": 0.000,
-    "pass1_duration_ms": 0.000,
-    "pass2plus_duration_ms": 0.000,
-    "total_duration_ms": 0.111,
+    "total_passes": 2,
+    "sample_size_actual": 361,
+    "fa_candidates_count": 175,
+    "sample_duration_ms": 0.463,
+    "pass1_duration_ms": 0.347,
+    "pass2plus_duration_ms": 0.165,
+    "total_duration_ms": 1.553,
     "index_build_duration_ms": 0.000,
     "fa_hit_rate": -1.000000,
-    "topKBound_after_pass1": 0.000000,
-    "partitions_pruned_pct": 0.000000
+    "topKBound_after_pass1": 23989.875590,
+    "partitions_pruned_pct": 0.981333
   }
 }
