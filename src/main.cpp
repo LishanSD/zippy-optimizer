@@ -1,9 +1,9 @@
 // main.cpp — CLI entry point for the Zippy top-k optimizer
 //
-// Phase 1: argument parsing, dataset loading, mode dispatch skeleton.
-// Algorithm implementations will be wired in during Phases 2–7.
+// Argument parsing, dataset loading, and mode dispatch.
+// Algorithm implementations are in zippy.cpp.
 
-#include "data_structures.h"
+#include "zippy.h"
 #include "utils.h"
 #include <cstdlib>
 #include <cstring>
@@ -11,27 +11,7 @@
 #include <vector>
 #include <string>
 
-// ---------------------------------------------------------------------------
-// ZippyConfig — mirrors the full config from zippy.h (Section 6).
-// Defined locally in Phase 1 to avoid depending on unimplemented headers.
-// Will be moved to zippy.h in Phase 2.
-// ---------------------------------------------------------------------------
-struct ZippyConfig {
-    size_t fa_capacity      = 50000;   // groups FA can hold
-    size_t n_partitions     = 10000;   // CA logical partition count
-    double sample_frac      = 0.01;    // uniform sample fraction
-    double delta            = 0.05;    // sampling tolerance Δ
-    double alpha_ci         = 0.05;    // CI confidence for sample size
-    double beta_ci          = 0.95;    // Hoeffding CI confidence
-    // Extension A
-    double underrep_threshold = 0.5;
-    size_t boost_rows         = 10;
-    // Extension B
-    size_t measure_m          = 500;
-    // Output
-    bool   output_fa_groups   = false;
-    bool   verbose            = false;
-};
+// ZippyConfig is defined in zippy.h
 
 int main(int argc, char* argv[]) {
     // 1. Parse arguments (hand-rolled — no getopt dependency)
@@ -95,15 +75,18 @@ int main(int argc, char* argv[]) {
             dataset[0].value);
 
     // 3. Dispatch to the appropriate mode
-    //    Phase 1: no algorithm is implemented yet — all modes print an error.
-    //    Phase 2 will add brute-force; Phase 4 will add baseline; etc.
     std::vector<std::pair<uint64_t,double>> results;
     std::vector<uint64_t> fa_groups;
     RunMetrics metrics;
+    cfg.output_fa_groups = (cfg.output_fa_groups);  // already parsed
+
+    Timer total_timer;
+    total_timer.reset();
 
     if (mode == "brute-force") {
-        fprintf(stderr, "ERROR: brute-force mode not yet implemented (Phase 2)\n");
-        return 1;
+        results = run_brute_force(dataset, k);
+        metrics.total_duration_ms = total_timer.elapsed_ms();
+        metrics.is_optimizable = true;   // brute-force always "works"
     } else if (mode == "baseline") {
         fprintf(stderr, "ERROR: baseline mode not yet implemented (Phase 4)\n");
         return 1;
