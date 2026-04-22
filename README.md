@@ -134,7 +134,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 2 | Brute-force baseline (correctness anchor) | ✅ Complete |
 | 3 | Core data structures (FATable, FMSketch, CATable) | ✅ Complete |
 | 4A | Sampler — uniform sampling + candidate selection (Algorithm 2) | ✅ Complete |
-| 4B | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | 🔲 Planned |
+| 4B | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | ✅ Complete |
 | 4C | MergeAndPrune + multi-pass convergence loop (full Algorithm 1) | 🔲 Planned |
 | 5 | Extension A — Stratified sampling via group index | 🔲 Planned |
 | 6 | Extension B — Measure column index (min-heap) | 🔲 Planned |
@@ -228,6 +228,13 @@ g++ -std=c++17 -O2 -o build/test_ds src/test_data_structures.cpp -Isrc/
 ```bash
 g++ -std=c++17 -O2 -o build/test_sampler src/test_sampler.cpp src/sampler.cpp -Isrc/
 ./build/test_sampler
+```
+
+### 7. Run Phase 4B gate test (single-pass baseline on S0)
+
+```bash
+g++ -std=c++17 -O2 -o build/test_phase4b src/test_phase4b.cpp src/zippy.cpp src/sampler.cpp -Isrc/
+./build/test_phase4b
 ```
 
 ---
