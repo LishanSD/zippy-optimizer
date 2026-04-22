@@ -88,8 +88,7 @@ int main(int argc, char* argv[]) {
         metrics.total_duration_ms = total_timer.elapsed_ms();
         metrics.is_optimizable = true;   // brute-force always "works"
     } else if (mode == "baseline") {
-        fprintf(stderr, "ERROR: baseline mode not yet implemented (Phase 4)\n");
-        return 1;
+        metrics = run_zippy_baseline(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-a") {
         fprintf(stderr, "ERROR: ext-a mode not yet implemented (Phase 5)\n");
         return 1;

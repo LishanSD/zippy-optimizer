@@ -1,8 +1,8 @@
 #pragma once
 // zippy.h — Public interface of the Zippy top-k engine.
 //
-// Phase 2: only run_brute_force() is implemented.
-// Subsequent phases will add baseline, ext-a, ext-b, ext-ab.
+// Phase 4B: brute-force + single-pass baseline are implemented.
+// Subsequent phases will add ext-a, ext-b, ext-ab and multi-pass baseline.
 
 #include "data_structures.h"
 #include "utils.h"
@@ -32,8 +32,16 @@ struct ZippyConfig {
 std::vector<std::pair<uint64_t,double>> run_brute_force(
     const std::vector<Row>& dataset, int k);
 
+// Phase 4B baseline: Algorithm 2 sampling + Pass 1 FA/CA routing + pruning.
+// For this phase, results are the FA top-k after Pass 1 (no Pass 2+ yet).
+RunMetrics run_zippy_baseline(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
 // ── Future phases will add these declarations ──────────────────────────────
-// Phase 4: RunMetrics run_zippy_baseline(...)
 // Phase 5: RunMetrics run_zippy_ext_a(...)
 // Phase 6: RunMetrics run_zippy_ext_b(...)
 // Phase 7: RunMetrics run_zippy_ext_ab(...)
