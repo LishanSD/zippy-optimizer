@@ -800,51 +800,266 @@ zippy-optimizer/
 ## 5.1 Recommended Implementation Order
 
 An agent building this from scratch should follow this sequence. Each step is
-independently testable before moving to the next.
+independently testable before moving to the next. Steps within a phase are
+sequential; do not skip ahead until the verification gate at the end of
+each phase passes.
 
-**Phase 1 — Data layer (no algorithm yet)**
-1. `python/generate_data.py` — write and test the Zipf generator and binary writer
-2. `src/utils.h` — implement the `Row` struct, binary file reader, and timer
-3. `src/main.cpp` — wire up CLI argument parsing (use `getopt_long` or a simple
-   hand-rolled parser); read dataset into `std::vector<Row>`; confirm it loads
-4. Verify: `./build/zippy --input data/test.bin --n-rows 1000 --k 5 --mode brute-force`
-   produces correct JSON output matching `pandas groupby` in Python
+> **Guiding principle:** Build the thinnest possible vertical slice first —
+> generate data → load it → compute brute-force top-k → verify. Only then add
+> Zippy's sampling, FA/CA routing, pruning, and multi-pass loop one piece at a
+> time. Each extension is a self-contained layer on top of baseline Zippy.
+
+---
+
+**Phase 1 — Build system + data layer (no algorithm yet)**
+
+1. **`CMakeLists.txt`** — write the CMake build configuration (Section 15). Ensure
+   `cmake .. -DCMAKE_BUILD_TYPE=Release && make` compiles an empty `main.cpp` that
+   returns 0. This catches toolchain issues early.
+
+2. **`python/generate_data.py`** — implement the full data generator (Section 9):
+   Zipf group-ID generation, value distributions, rare-group injection, binary
+   writer, and UINT64_MAX sentinel masking. Test by generating a **tiny** dataset:
+   ```bash
+   python python/generate_data.py --output data/tiny.bin \
+       --n-rows 1000 --n-groups 50 --zipf-alpha 1.2 \
+       --rare-group-fraction 0.1 --rare-group-rows 3 \
+       --rare-group-value-multiplier 100
+   ```
+   Verify the output file size equals `n_rows_actual × 16` bytes.
+   Also generate the small test dataset **S0** (10K rows, 500 groups, same params)
+   for use throughout Phases 2–4. S0 is small enough for sub-second C++ runs
+   during rapid debugging.
+
+3. **`src/utils.h`** — implement `Timer`, `RunMetrics`, and `write_output_json()`
+   exactly as specified in Section 6. Do NOT put the `Row` struct here — it belongs
+   in `data_structures.h` (next step).
+
+4. **`src/data_structures.h`** — define the `Row` struct and all four hash functions
+   (`partition_hash`, `fa_hash`, `fm_hash`, `child_partition_hash`) as specified in
+   Section 6. These are standalone and have no dependencies beyond `<cstdint>`.
+   Leave the `FATable`, `CATable`, `FMSketch` class bodies as forward declarations
+   or stubs — they will be filled in Phase 3.
+
+5. **`src/main.cpp`** — implement CLI argument parsing (hand-rolled, per Section 6's
+   `main.cpp` template), binary file loading into `std::vector<Row>`, and mode
+   dispatch skeleton (switch on `--mode`, print "mode not implemented" for
+   everything except `brute-force`). Wire `write_output_json()` for output.
+
+6. **Gate:** Build and run:
+   ```bash
+   ./build/zippy --input data/tiny.bin --n-rows 1000 --k 5 \
+       --mode brute-force --output results/tiny_bf.json
+   ```
+   This will fail (brute-force not implemented yet), but it must **compile, load
+   the dataset, and print a sensible error** (e.g., "mode not implemented"). This
+   confirms the data pipeline works end-to-end.
+
+---
 
 **Phase 2 — Brute-force baseline (correctness anchor)**
-5. `src/zippy.cpp` — implement `brute_force()`: one pass through all rows,
-   `std::unordered_map<uint64_t,double>` for exact aggregates, then `nth_element`
-   to find top-k. This is the ground-truth comparator for all other modes.
+
+7. **`src/zippy.cpp` + `src/zippy.h`** — implement `run_brute_force()` only:
+   one pass through all rows, `std::unordered_map<uint64_t,double>` for exact
+   aggregates, then `std::partial_sort` to find top-k (Section 7, "Brute-Force
+   Mode Implementation"). Wire this into the mode dispatch in `main.cpp`.
+
+8. **Gate:** Run brute-force on the tiny dataset and S0:
+   ```bash
+   ./build/zippy --input data/tiny.bin --n-rows 1000 --k 5 \
+       --mode brute-force --output results/tiny_bf.json
+   ```
+   Cross-check the JSON output against a Python pandas `groupby().sum()` on the
+   same binary file. The top-k group IDs and aggregates must match exactly
+   (within floating-point tolerance ≤ 1e-6). This is your ground truth for
+   all future correctness checks.
+
+---
 
 **Phase 3 — Core data structures**
-6. `src/data_structures.h` — implement `FATable` (linear probing), `FMSketch`,
-   `CAPartition`, `CATable`
-7. Unit-test FATable: insert 1000 known group_ids, verify contains/update/get,
-   verify no false positives for non-inserted keys, verify top_k returns correct order
 
-**Phase 4 — Baseline Zippy (Algorithm 2 → 1 → 3 → 4)**
-8. `src/sampler.cpp` — uniform random sampler (Algorithm 2, simplified: no CI)
-9. `src/zippy.cpp` — implement `run_zippy()`:
-   - Call sampler → get FAgroups
-   - Pass 1: route rows to FA or CA (Algorithm 3, logical partitioning only)
-   - MergeAndPrune (Algorithm 4): compute topKBound, prune partitions
-   - Pass 2+: re-scan survivors until convergence (Algorithm 1 while-loop)
-10. Verify correctness on S1 dataset against brute-force output
+9. **`FATable` in `data_structures.h`** — implement the full linear-probing hash
+   table: constructor (allocates `2 × capacity` slots, fills with `FA_EMPTY_KEY`),
+   `contains()`, `insert()`, `update()`, `get()`, `top_k()`. Follow the exact
+   spec in Section 6 (sentinel key, 50% load factor, `fa_hash()`).
 
-**Phase 5 — Extension A**
-11. `src/group_index.cpp` — GroupOccurrenceIndex build + query
-12. `src/stratified_sampler.cpp` — two-phase sampler using GroupIndex
-13. Wire into `src/zippy.cpp` under `--mode ext-a`
-14. Verify correctness on S2 (adversarial) dataset
+10. **`FMSketch` in `data_structures.h`** — implement the minimal FM sketch:
+    `bitmap`, `update(group_id)` using `fm_hash()`, `estimate()` using trailing
+    zeros. Tiny struct, no dependencies.
 
-**Phase 6 — Extension B**
-15. `src/measure_index.cpp` — min-heap MeasureIndex
-16. Wire into `src/zippy.cpp` under `--mode ext-b`
-17. Verify correctness on S2 dataset
+11. **`CAPartition` + `CATable` in `data_structures.h`** — implement the partition
+    struct (`total_sum`, `max_value`, `min_value`, `count`, `FMSketch`, `pruned`,
+    `estimated_per_group_sum()`) and the `CATable` class (`partition_of()`,
+    `update()`, `prune()`, `surviving_partitions()`,
+    `ranked_surviving_partitions()`). Follow the `CATable::update()` body in
+    Section 6 exactly.
 
-**Phase 7 — Combined and experiments**
-18. Wire `--mode ext-ab` (both extensions)
-19. `python/run_experiments.py` — run full experiment matrix
-20. `python/plot_results.py` — produce plots
+12. **Gate — unit-test data structures:** Write a small test (can be in `main.cpp`
+    behind a `--test` flag, or a separate test file):
+    - **FATable:** insert 1000 known group_ids with known values, verify
+      `contains()` returns true for all inserted keys and false for 1000
+      non-inserted keys, verify `get()` returns correct sums, verify `top_k(10)`
+      returns the correct 10 groups in descending order.
+    - **FMSketch:** feed 10, 100, 1000, 10000 distinct IDs; verify `estimate()`
+      is within 3× of the true count (FM is rough — order-of-magnitude is fine).
+    - **CATable:** route 10K rows, verify `prune()` marks the right partitions,
+      verify `ranked_surviving_partitions()` returns descending estimated order.
+
+---
+
+**Phase 4A — Sampler (Algorithm 2, standalone)**
+
+The sampler can be built and tested in complete isolation — it has no dependency
+on FATable/CATable routing. Get it right before wiring it into the pipeline.
+
+13. **`src/sampler.h` + `src/sampler.cpp`** — implement `uniform_sample_and_select()`
+    (Algorithm 2, simplified: point estimates, no full Hoeffding CI). This function:
+    - Computes sample size = `max(ceil(z² / (4Δ²)), sample_frac × N)`.
+    - Selects rows with probability `p = sample_size / N`.
+    - Aggregates sampled rows into `SampleGroupStats` per group.
+    - Selects top `fa_capacity` groups by sample aggregate as FA candidates.
+    - Fills remaining FA slots with heavy hitters (highest sample count).
+    - Returns `SampleResult` with `is_optimizable` flag and `fa_groups` set.
+
+14. **Gate — sampler unit test:** Write a small test (inline in a scratch file or
+    behind a `--test-sampler` flag):
+    - Generate or load the S0 dataset (10K rows, 500 groups, Zipf α=1.2).
+    - Call `uniform_sample_and_select()` with `fa_capacity = 100`.
+    - Verify: `is_optimizable == true` (data is skewed).
+    - Verify: `fa_groups.size() == fa_capacity` (all slots filled).
+    - Verify: the true top-10 groups (from brute-force) appear in `fa_groups`
+      with high probability (≥8 out of 10 for Zipf α=1.2).
+    - Print the sample duration and candidate list for manual inspection.
+
+---
+
+**Phase 4B — Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1 only)**
+
+Wire the sampler output into FATable/CATable for a single data pass and verify
+that pruning works correctly. Do NOT implement multi-pass yet — that's Phase 4C.
+
+15. **Pass 1 in `src/zippy.cpp`** — implement the first-pass FA/CA routing loop
+    (Algorithm 3, lines 21–28, logical partitioning only):
+    - Initialise `FATable` with candidates from sampler.
+    - Initialise `CATable` with `n_partitions` empty partitions.
+    - Iterate all rows: if `fa.contains(gid)` → `fa.update(gid, val)`;
+      else → `ca.update(gid, val)`.
+    - After the loop: compute `topKBound` = k-th largest FA value via `fa.top_k(k)`.
+    - Call `ca.prune(topKBound)`.
+    - Record `partitions_pruned_pct` and `topKBound_after_pass1` in metrics.
+
+16. **Gate — single-pass verification on S0:**
+    - Expose a temporary `run_zippy_single_pass()` (or reuse `run_zippy_baseline()`
+      but skip the multi-pass loop — just return FA top-k after pass 1).
+    - Run on S0: the FA top-k should overlap ≥80% with brute-force top-k.
+    - Print: `topKBound`, `partitions_pruned_pct`, FA candidate list, surviving
+      partition count. With Zipf α=1.2, expect >50% pruning.
+    - Cross-check: no brute-force top-k group should be in a **pruned** partition
+      (this would mean pruning is unsafe — a critical bug).
+
+---
+
+**Phase 4C — MergeAndPrune + multi-pass loop (full Algorithm 1)**
+
+Add the convergence loop: after Pass 1 pruning, re-scan surviving partitions
+until all top-k groups are confirmed with exact aggregates.
+
+17. **MergeAndPrune in `src/zippy.cpp`** — implement Algorithm 4:
+    - Merge `partialAggregates` into cumulative `exactAggregates`.
+    - Compute UBs for child partitions (`total_sum` for SUM).
+    - Compute `topKBound` as the k-th highest among exact aggregates ∪ UBs.
+    - Prune child partitions with UB < topKBound.
+    - Check early termination: if k groups have exact aggs > topKBound, done.
+
+18. **Multi-pass loop in `src/zippy.cpp`** — implement Algorithm 1's while-loop:
+    - Pass 2+: re-scan the dataset, filter rows to surviving partitions, re-hash
+      with `child_partition_hash(gid, n_partitions, pass)`, route FA rows to
+      `partialAggregates` and non-FA rows to `childPartitions`.
+    - Call MergeAndPrune after each pass.
+    - Loop until `top_k_confirmed >= k` or no surviving partitions remain.
+    - Wire this as `run_zippy_baseline()` and expose under `--mode baseline`.
+
+19. **Gate — correctness on S0 and S1:**
+    - Generate **S1** dataset (10M rows, 1M groups, no rare groups).
+    - Run `--mode baseline` and `--mode brute-force` on S0 (small, instant).
+    - Compare: top-k group ID **sets** must be identical.
+    - Run on S1: sets must still match. Record `total_passes` and
+      `partitions_pruned_pct` — with Zipf α=1.2 and no rare groups, expect
+      high pruning (>90%) and convergence in 1–2 passes.
+
+---
+
+**Phase 5 — Extension A (stratified sampling)**
+
+20. **`src/group_index.h` + `src/group_index.cpp`** — implement
+    `GroupOccurrenceIndex`: `build()` (one scan, populate
+    `unordered_map<gid, vector<row_pos>>`), `is_underrepresented()`,
+    `get_boost_rows()`, `group_count()`, `row_count_for()`.
+
+21. **`src/stratified_sampler.h` + `src/stratified_sampler.cpp`** — implement the
+    two-phase sampler:
+    - Phase 1: uniform sample (reuse `uniform_sample_and_select` logic).
+    - Phase 2: iterate all groups in GroupIndex, check underrepresentation,
+      fetch boost rows from the index, add to sample aggregates.
+    - Merge and select top `fa_capacity` groups as FA candidates.
+
+22. **Wire `--mode ext-a`** in `zippy.cpp` — call `run_zippy_ext_a()` which uses
+    the stratified sampler instead of the uniform sampler. The rest of the Zippy
+    pipeline (Pass 1, MergeAndPrune, multi-pass) is identical to baseline.
+
+23. **Gate — correctness on S2:**
+    - Generate **S2** dataset (10M rows, 1M groups, 0.01% rare groups).
+    - Run `--mode ext-a`, `--mode baseline`, `--mode brute-force` on S2.
+    - All top-k sets must match brute-force. Compare `fa_hit_rate` and
+      `partitions_pruned_pct` between baseline and ext-a — ext-a should show
+      improvement on the adversarial dataset.
+
+---
+
+**Phase 6 — Extension B (measure column index)**
+
+24. **`src/measure_index.h` + `src/measure_index.cpp`** — implement the min-heap
+    `MeasureIndex`: `process(value, group_id)` called per row during a single
+    build pass, `get_forced_candidates()` returns `unordered_set<uint64_t>` of
+    group IDs from the top-m rows.
+
+25. **Wire `--mode ext-b`** in `zippy.cpp` — call `run_zippy_ext_b()` which:
+    - Builds MeasureIndex in one pass → extracts FORCED_SET.
+    - Reserves FORCED_SET slots in FA before sampling.
+    - Fills remaining FA slots from uniform sampling candidates.
+    - Runs normal Zippy pipeline.
+
+26. **Gate — correctness on S2:**
+    - Run `--mode ext-b` and `--mode brute-force` on S2.
+    - Top-k sets must match. Compare `topKBound_after_pass1` between baseline
+      and ext-b — ext-b should produce a higher bound.
+
+---
+
+**Phase 7 — Combined mode**
+
+27. **Wire `--mode ext-ab`** in `zippy.cpp` — combines both extensions:
+    - Build GroupOccurrenceIndex + MeasureIndex (can share the same scan pass
+      or run sequentially).
+    - FORCED_SET occupies FA slots first, then stratified sampling fills the rest.
+    - Run normal Zippy pipeline.
+
+28. **Gate — full correctness sweep:**
+    - Run `python/verify_correctness.py` (Section 13) across S1, S2, S3 for all
+      four modes. **All must pass before proceeding to experiments.**
+
+---
+
+**Phase 8 — Experiments, plotting, and documentation**
+
+29. **`python/run_experiments.py`** — implement the full experiment driver
+    (Section 11): main matrix (S1–S5 × 5 modes) plus parameter sweeps on S2
+    (measure_m, underrep_threshold, k). Generate datasets S3–S5 at this point.
+    Run the full matrix. Collect all JSON results.
+
+30. **`python/plot_results.py`** — implement all 9 plots specified in Section 11.
+    Save to `plots/`. Update `README.md` with build instructions, usage examples,
+    and a summary of results.
 
 ---
 
