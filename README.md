@@ -133,7 +133,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 1 | Build system + data generator + CLI skeleton | ✅ Complete |
 | 2 | Brute-force baseline (correctness anchor) | ✅ Complete |
 | 3 | Core data structures (FATable, FMSketch, CATable) | ✅ Complete |
-| 4A | Sampler — uniform sampling + candidate selection (Algorithm 2) | 🔲 Next |
+| 4A | Sampler — uniform sampling + candidate selection (Algorithm 2) | ✅ Complete |
 | 4B | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | 🔲 Planned |
 | 4C | MergeAndPrune + multi-pass convergence loop (full Algorithm 1) | 🔲 Planned |
 | 5 | Extension A — Stratified sampling via group index | 🔲 Planned |
@@ -221,6 +221,13 @@ python python/verify_phase2.py
 ```bash
 g++ -std=c++17 -O2 -o build/test_ds src/test_data_structures.cpp -Isrc/
 ./build/test_ds
+```
+
+### 6. Run sampler unit test (Phase 4A gate)
+
+```bash
+g++ -std=c++17 -O2 -o build/test_sampler src/test_sampler.cpp src/sampler.cpp -Isrc/
+./build/test_sampler
 ```
 
 ---
