@@ -907,9 +907,10 @@ each phase passes.
 
 ---
 
-**Phase 4 — Baseline Zippy (Algorithms 2 → 3 → 4 inside Algorithm 1)**
+**Phase 4A — Sampler (Algorithm 2, standalone)**
 
-This is the most complex phase. Build it in sub-steps and verify after each.
+The sampler can be built and tested in complete isolation — it has no dependency
+on FATable/CATable routing. Get it right before wiring it into the pipeline.
 
 13. **`src/sampler.h` + `src/sampler.cpp`** — implement `uniform_sample_and_select()`
     (Algorithm 2, simplified: point estimates, no full Hoeffding CI). This function:
@@ -920,7 +921,24 @@ This is the most complex phase. Build it in sub-steps and verify after each.
     - Fills remaining FA slots with heavy hitters (highest sample count).
     - Returns `SampleResult` with `is_optimizable` flag and `fa_groups` set.
 
-14. **Pass 1 in `src/zippy.cpp`** — implement the first-pass FA/CA routing loop
+14. **Gate — sampler unit test:** Write a small test (inline in a scratch file or
+    behind a `--test-sampler` flag):
+    - Generate or load the S0 dataset (10K rows, 500 groups, Zipf α=1.2).
+    - Call `uniform_sample_and_select()` with `fa_capacity = 100`.
+    - Verify: `is_optimizable == true` (data is skewed).
+    - Verify: `fa_groups.size() == fa_capacity` (all slots filled).
+    - Verify: the true top-10 groups (from brute-force) appear in `fa_groups`
+      with high probability (≥8 out of 10 for Zipf α=1.2).
+    - Print the sample duration and candidate list for manual inspection.
+
+---
+
+**Phase 4B — Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1 only)**
+
+Wire the sampler output into FATable/CATable for a single data pass and verify
+that pruning works correctly. Do NOT implement multi-pass yet — that's Phase 4C.
+
+15. **Pass 1 in `src/zippy.cpp`** — implement the first-pass FA/CA routing loop
     (Algorithm 3, lines 21–28, logical partitioning only):
     - Initialise `FATable` with candidates from sampler.
     - Initialise `CATable` with `n_partitions` empty partitions.
@@ -930,14 +948,30 @@ This is the most complex phase. Build it in sub-steps and verify after each.
     - Call `ca.prune(topKBound)`.
     - Record `partitions_pruned_pct` and `topKBound_after_pass1` in metrics.
 
-15. **MergeAndPrune in `src/zippy.cpp`** — implement Algorithm 4:
+16. **Gate — single-pass verification on S0:**
+    - Expose a temporary `run_zippy_single_pass()` (or reuse `run_zippy_baseline()`
+      but skip the multi-pass loop — just return FA top-k after pass 1).
+    - Run on S0: the FA top-k should overlap ≥80% with brute-force top-k.
+    - Print: `topKBound`, `partitions_pruned_pct`, FA candidate list, surviving
+      partition count. With Zipf α=1.2, expect >50% pruning.
+    - Cross-check: no brute-force top-k group should be in a **pruned** partition
+      (this would mean pruning is unsafe — a critical bug).
+
+---
+
+**Phase 4C — MergeAndPrune + multi-pass loop (full Algorithm 1)**
+
+Add the convergence loop: after Pass 1 pruning, re-scan surviving partitions
+until all top-k groups are confirmed with exact aggregates.
+
+17. **MergeAndPrune in `src/zippy.cpp`** — implement Algorithm 4:
     - Merge `partialAggregates` into cumulative `exactAggregates`.
     - Compute UBs for child partitions (`total_sum` for SUM).
     - Compute `topKBound` as the k-th highest among exact aggregates ∪ UBs.
     - Prune child partitions with UB < topKBound.
     - Check early termination: if k groups have exact aggs > topKBound, done.
 
-16. **Multi-pass loop in `src/zippy.cpp`** — implement Algorithm 1's while-loop:
+18. **Multi-pass loop in `src/zippy.cpp`** — implement Algorithm 1's while-loop:
     - Pass 2+: re-scan the dataset, filter rows to surviving partitions, re-hash
       with `child_partition_hash(gid, n_partitions, pass)`, route FA rows to
       `partialAggregates` and non-FA rows to `childPartitions`.
@@ -945,7 +979,7 @@ This is the most complex phase. Build it in sub-steps and verify after each.
     - Loop until `top_k_confirmed >= k` or no surviving partitions remain.
     - Wire this as `run_zippy_baseline()` and expose under `--mode baseline`.
 
-17. **Gate — correctness on S0 and S1:**
+19. **Gate — correctness on S0 and S1:**
     - Generate **S1** dataset (10M rows, 1M groups, no rare groups).
     - Run `--mode baseline` and `--mode brute-force` on S0 (small, instant).
     - Compare: top-k group ID **sets** must be identical.
@@ -957,23 +991,23 @@ This is the most complex phase. Build it in sub-steps and verify after each.
 
 **Phase 5 — Extension A (stratified sampling)**
 
-18. **`src/group_index.h` + `src/group_index.cpp`** — implement
+20. **`src/group_index.h` + `src/group_index.cpp`** — implement
     `GroupOccurrenceIndex`: `build()` (one scan, populate
     `unordered_map<gid, vector<row_pos>>`), `is_underrepresented()`,
     `get_boost_rows()`, `group_count()`, `row_count_for()`.
 
-19. **`src/stratified_sampler.h` + `src/stratified_sampler.cpp`** — implement the
+21. **`src/stratified_sampler.h` + `src/stratified_sampler.cpp`** — implement the
     two-phase sampler:
     - Phase 1: uniform sample (reuse `uniform_sample_and_select` logic).
     - Phase 2: iterate all groups in GroupIndex, check underrepresentation,
       fetch boost rows from the index, add to sample aggregates.
     - Merge and select top `fa_capacity` groups as FA candidates.
 
-20. **Wire `--mode ext-a`** in `zippy.cpp` — call `run_zippy_ext_a()` which uses
+22. **Wire `--mode ext-a`** in `zippy.cpp` — call `run_zippy_ext_a()` which uses
     the stratified sampler instead of the uniform sampler. The rest of the Zippy
     pipeline (Pass 1, MergeAndPrune, multi-pass) is identical to baseline.
 
-21. **Gate — correctness on S2:**
+23. **Gate — correctness on S2:**
     - Generate **S2** dataset (10M rows, 1M groups, 0.01% rare groups).
     - Run `--mode ext-a`, `--mode baseline`, `--mode brute-force` on S2.
     - All top-k sets must match brute-force. Compare `fa_hit_rate` and
@@ -984,18 +1018,18 @@ This is the most complex phase. Build it in sub-steps and verify after each.
 
 **Phase 6 — Extension B (measure column index)**
 
-22. **`src/measure_index.h` + `src/measure_index.cpp`** — implement the min-heap
+24. **`src/measure_index.h` + `src/measure_index.cpp`** — implement the min-heap
     `MeasureIndex`: `process(value, group_id)` called per row during a single
     build pass, `get_forced_candidates()` returns `unordered_set<uint64_t>` of
     group IDs from the top-m rows.
 
-23. **Wire `--mode ext-b`** in `zippy.cpp` — call `run_zippy_ext_b()` which:
+25. **Wire `--mode ext-b`** in `zippy.cpp` — call `run_zippy_ext_b()` which:
     - Builds MeasureIndex in one pass → extracts FORCED_SET.
     - Reserves FORCED_SET slots in FA before sampling.
     - Fills remaining FA slots from uniform sampling candidates.
     - Runs normal Zippy pipeline.
 
-24. **Gate — correctness on S2:**
+26. **Gate — correctness on S2:**
     - Run `--mode ext-b` and `--mode brute-force` on S2.
     - Top-k sets must match. Compare `topKBound_after_pass1` between baseline
       and ext-b — ext-b should produce a higher bound.
@@ -1004,13 +1038,13 @@ This is the most complex phase. Build it in sub-steps and verify after each.
 
 **Phase 7 — Combined mode**
 
-25. **Wire `--mode ext-ab`** in `zippy.cpp` — combines both extensions:
+27. **Wire `--mode ext-ab`** in `zippy.cpp` — combines both extensions:
     - Build GroupOccurrenceIndex + MeasureIndex (can share the same scan pass
       or run sequentially).
     - FORCED_SET occupies FA slots first, then stratified sampling fills the rest.
     - Run normal Zippy pipeline.
 
-26. **Gate — full correctness sweep:**
+28. **Gate — full correctness sweep:**
     - Run `python/verify_correctness.py` (Section 13) across S1, S2, S3 for all
       four modes. **All must pass before proceeding to experiments.**
 
@@ -1018,12 +1052,12 @@ This is the most complex phase. Build it in sub-steps and verify after each.
 
 **Phase 8 — Experiments, plotting, and documentation**
 
-27. **`python/run_experiments.py`** — implement the full experiment driver
+29. **`python/run_experiments.py`** — implement the full experiment driver
     (Section 11): main matrix (S1–S5 × 5 modes) plus parameter sweeps on S2
     (measure_m, underrep_threshold, k). Generate datasets S3–S5 at this point.
     Run the full matrix. Collect all JSON results.
 
-28. **`python/plot_results.py`** — implement all 9 plots specified in Section 11.
+30. **`python/plot_results.py`** — implement all 9 plots specified in Section 11.
     Save to `plots/`. Update `README.md` with build instructions, usage examples,
     and a summary of results.
 
