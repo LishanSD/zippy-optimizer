@@ -63,10 +63,15 @@
     "sample_duration_ms": 0.000,
     "pass1_duration_ms": 0.000,
     "pass2plus_duration_ms": 0.000,
-    "total_duration_ms": 215.886,
+    "total_duration_ms": 418.355,
     "index_build_duration_ms": 0.000,
     "fa_hit_rate": -1.000000,
     "topKBound_after_pass1": 0.000000,
-    "partitions_pruned_pct": 0.000000
+    "partitions_pruned_pct": 0.000000,
+    "l_k_lower_bound": 0.000000,
+    "cs_above_lk": 0,
+    "partitions_exact_agg": 0,
+    "partitions_logical": 0,
+    "partitions_physical": 0
   }
 }
