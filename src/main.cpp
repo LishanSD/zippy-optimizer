@@ -32,6 +32,16 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "--delta"))        cfg.delta         = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--alpha-ci"))     cfg.alpha_ci      = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--beta-ci"))      cfg.beta_ci       = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--agg")) {
+            const char* agg = argv[++i];
+            if      (!strcmp(agg, "sum"))   cfg.agg_type = AggregateType::SUM;
+            else if (!strcmp(agg, "count")) cfg.agg_type = AggregateType::COUNT;
+            else if (!strcmp(agg, "max"))   cfg.agg_type = AggregateType::MAX;
+            else if (!strcmp(agg, "min"))   cfg.agg_type = AggregateType::MIN;
+            else { fprintf(stderr, "Unknown agg type: %s (use sum|count|max|min)\n", agg); return 1; }
+        }
+        else if (!strcmp(argv[i], "--locality-threshold"))    cfg.locality_threshold    = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--locality-segment-size")) cfg.locality_segment_size = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--underrep-threshold")) cfg.underrep_threshold = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--boost-rows"))   cfg.boost_rows    = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--measure-m"))    cfg.measure_m     = std::stoull(argv[++i]);

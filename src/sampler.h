@@ -13,9 +13,10 @@ struct SampleGroupStats {
     double count = 0.0;
     double min_val = std::numeric_limits<double>::max();
     double max_val = std::numeric_limits<double>::lowest();
+    double hoeffding_lb = 0.0;  // Hoeffding lower bound on full-dataset sum (computed after sampling)
 };
 
-// Result of Algorithm 2 (simplified): sampling + FA candidate selection.
+// Result of Algorithm 2: sampling + FA candidate selection via Hoeffding CI bounds.
 struct SampleResult {
     bool is_optimizable = true;
     std::unordered_set<uint64_t> fa_groups;
@@ -23,9 +24,9 @@ struct SampleResult {
     size_t sample_size_actual = 0;
 };
 
-// Uniform random sampling and FA candidate selection.
-// Simplification for the prototype: use point estimates (epsilon = 0) instead of
-// full Hoeffding confidence intervals, then select top fa_capacity by sample sum.
+// Uniform random sampling and FA candidate selection (Algorithm 2).
+// Implements Hoeffding CI lower bounds for candidate selection and L_k gate.
+// k: number of top-k groups requested (used for L_k threshold computation).
 SampleResult uniform_sample_and_select(
     const std::vector<Row>& dataset,
     size_t fa_capacity,
@@ -33,4 +34,5 @@ SampleResult uniform_sample_and_select(
     double delta,
     double alpha_ci,
     double beta_ci,
-    uint64_t seed = 42);
+    uint64_t seed = 42,
+    size_t k = 0);

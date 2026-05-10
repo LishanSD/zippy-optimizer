@@ -17,6 +17,10 @@ struct ZippyConfig {
     double delta            = 0.05;    // sampling tolerance Δ
     double alpha_ci         = 0.05;    // CI confidence for sample size
     double beta_ci          = 0.95;    // Hoeffding CI confidence
+    AggregateType agg_type  = AggregateType::SUM;  // aggregate function
+    // Algorithm 3 locality parameters (patent defaults: s=100k, α₀=0.20)
+    double locality_threshold    = 0.20;
+    size_t locality_segment_size = 100'000;
     // Extension A
     double underrep_threshold = 0.5;
     size_t boost_rows         = 10;

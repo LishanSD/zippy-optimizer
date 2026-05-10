@@ -87,9 +87,11 @@ inline uint32_t portable_ctzll(uint64_t x) {
 #include <cassert>
 #include <cmath>
 
+enum class AggregateType { SUM, COUNT, MAX, MIN };
+
 struct FAEntry {
     uint64_t group_id = FA_EMPTY_KEY;  // FA_EMPTY_KEY means slot is vacant
-    double   exact_sum = 0.0;          // running exact aggregate (SUM queries)
+    double   exact_agg = 0.0;          // running exact aggregate (type-dependent)
     // 16 bytes total — 4 entries fit per 64-byte cache line
 };
 
@@ -123,8 +125,9 @@ public:
     }
 
     // Insert a group_id as an FA candidate (called during setup, before Pass 1).
-    // Initialises exact_sum to 0. Idempotent: re-inserting an existing key is a no-op.
-    void insert(uint64_t group_id) {
+    // Idempotent: re-inserting an existing key is a no-op.
+    // initial_agg: identity value for the aggregate type (0 for SUM/COUNT, lowest() for MAX, max() for MIN).
+    void insert(uint64_t group_id, double initial_agg = 0.0) {
         assert(group_id != FA_EMPTY_KEY && "Cannot insert sentinel key");
         size_t idx = probe(group_id);
         for (size_t i = 0; i < table_.size(); ++i) {
@@ -135,7 +138,7 @@ public:
             if (table_[pos].group_id == FA_EMPTY_KEY) {
                 assert(occupied_ < capacity_ && "FA table is full");
                 table_[pos].group_id = group_id;
-                table_[pos].exact_sum = 0.0;
+                table_[pos].exact_agg = initial_agg;
                 ++occupied_;
                 return;
             }
@@ -144,12 +147,17 @@ public:
 
     // Update aggregate for a known FA group (called in Pass 1 hot loop).
     // Precondition: group_id was previously inserted via insert().
-    void update(uint64_t group_id, double val) {
+    void update(uint64_t group_id, double val, AggregateType agg_type = AggregateType::SUM) {
         size_t idx = probe(group_id);
         for (size_t i = 0; i < table_.size(); ++i) {
             size_t pos = (idx + i) % table_.size();
             if (table_[pos].group_id == group_id) {
-                table_[pos].exact_sum += val;
+                switch (agg_type) {
+                    case AggregateType::SUM:   table_[pos].exact_agg += val; break;
+                    case AggregateType::COUNT: table_[pos].exact_agg += 1.0; break;
+                    case AggregateType::MAX:   if (val > table_[pos].exact_agg) table_[pos].exact_agg = val; break;
+                    case AggregateType::MIN:   if (val < table_[pos].exact_agg) table_[pos].exact_agg = val; break;
+                }
                 return;
             }
             if (table_[pos].group_id == FA_EMPTY_KEY) {
@@ -162,26 +170,38 @@ public:
         size_t idx = probe(group_id);
         for (size_t i = 0; i < table_.size(); ++i) {
             size_t pos = (idx + i) % table_.size();
-            if (table_[pos].group_id == group_id) return table_[pos].exact_sum;
+            if (table_[pos].group_id == group_id) return table_[pos].exact_agg;
             if (table_[pos].group_id == FA_EMPTY_KEY) return 0.0;
         }
         return 0.0;
     }
 
-    // Return the top-k groups by exact_sum, sorted descending.
-    std::vector<std::pair<uint64_t,double>> top_k(size_t k) const {
-        // Collect all occupied entries
+    // Return the top-k groups by exact_agg.
+    // For SUM/COUNT/MAX: sorted descending (highest first).
+    // For MIN: sorted ascending (lowest first), since top-k MIN = smallest values.
+    std::vector<std::pair<uint64_t,double>> top_k(size_t k, AggregateType agg_type = AggregateType::SUM) const {
         std::vector<std::pair<uint64_t,double>> entries;
         entries.reserve(occupied_);
         for (const auto& e : table_) {
             if (e.group_id != FA_EMPTY_KEY) {
-                entries.emplace_back(e.group_id, e.exact_sum);
+                entries.emplace_back(e.group_id, e.exact_agg);
             }
         }
         size_t n = std::min(k, entries.size());
         if (n > 0) {
-            std::partial_sort(entries.begin(), entries.begin() + n, entries.end(),
-                [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (agg_type == AggregateType::MIN) {
+                std::partial_sort(entries.begin(), entries.begin() + n, entries.end(),
+                    [](const auto& a, const auto& b) {
+                        if (a.second != b.second) return a.second < b.second;
+                        return a.first < b.first;
+                    });
+            } else {
+                std::partial_sort(entries.begin(), entries.begin() + n, entries.end(),
+                    [](const auto& a, const auto& b) {
+                        if (a.second != b.second) return a.second > b.second;
+                        return a.first < b.first;
+                    });
+            }
         }
         entries.resize(n);
         return entries;
@@ -261,6 +281,18 @@ struct CAPartition {
     FMSketch fm;                                                 // approx distinct groups
     bool     pruned    = false;                                  // pruned flag
 
+    // Upper bound on any group's aggregate within this partition.
+    // Patent col. 13: SUM/AVG UB = total_sum; MAX UB = max_value; MIN UB = min_value; COUNT UB = count.
+    double upper_bound(AggregateType t) const {
+        switch (t) {
+            case AggregateType::SUM:   return total_sum;
+            case AggregateType::COUNT: return static_cast<double>(count);
+            case AggregateType::MAX:   return max_value;
+            case AggregateType::MIN:   return min_value;
+        }
+        return total_sum;
+    }
+
     // Estimated per-group aggregate (Algorithm 4 partition ranking).
     // Patent formula: total_sum / approx_distinct_count.
     double estimated_per_group_sum() const {
@@ -299,12 +331,17 @@ public:
         part.fm.update(group_id);
     }
 
-    // Prune all partitions whose total_sum < topKBound.
-    // Safe for SUM: total_sum is an upper bound on any group's aggregate.
-    void prune(double topKBound) {
+    // Prune partitions that cannot contain a top-k group for the given aggregate type.
+    // SUM/COUNT/MAX: prune when upper_bound < bound (bound = k-th highest aggregate).
+    // MIN: prune when upper_bound > bound (bound = k-th lowest / largest-min-value allowed).
+    void prune(double bound, AggregateType agg_type = AggregateType::SUM) {
         for (auto& part : partitions_) {
-            if (!part.pruned && part.total_sum < topKBound) {
-                part.pruned = true;
+            if (part.pruned) continue;
+            const double ub = part.upper_bound(agg_type);
+            if (agg_type == AggregateType::MIN) {
+                if (ub > bound) part.pruned = true;
+            } else {
+                if (ub < bound) part.pruned = true;
             }
         }
     }

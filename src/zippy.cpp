@@ -61,14 +61,43 @@ bool row_in_active_path(
     return true;
 }
 
+// kth_bound: k-th value to use as pruning threshold.
+// For MIN, we want the k-th *lowest* exact value (largest allowed min).
+double kth_bound_for_exact(std::vector<double>& values, size_t k, AggregateType agg_type) {
+    if (k == 0 || values.empty()) return 0.0;
+    if (agg_type == AggregateType::MIN) {
+        if (values.size() < k) return std::numeric_limits<double>::max();
+        std::nth_element(values.begin(), values.begin() + (k - 1), values.end());
+        return values[k - 1];
+    }
+    return kth_highest_or_zero(values, k);
+}
+
 MergeAndPruneResult merge_and_prune(
     ExactAggregates& exact_aggregates,
     const PartialAggregates& partial_aggregates,
     const ChildPartitions& child_partitions,
-    size_t k)
+    size_t k,
+    AggregateType agg_type)
 {
+    // Merge partial aggregates into exact (operator depends on type)
     for (const auto& [gid, val] : partial_aggregates) {
-        exact_aggregates[gid] += val;
+        switch (agg_type) {
+            case AggregateType::SUM:   exact_aggregates[gid] += val; break;
+            case AggregateType::COUNT: exact_aggregates[gid] += val; break;
+            case AggregateType::MAX: {
+                auto it = exact_aggregates.find(gid);
+                if (it == exact_aggregates.end()) exact_aggregates[gid] = val;
+                else if (val > it->second) it->second = val;
+                break;
+            }
+            case AggregateType::MIN: {
+                auto it = exact_aggregates.find(gid);
+                if (it == exact_aggregates.end()) exact_aggregates[gid] = val;
+                else if (val < it->second) it->second = val;
+                break;
+            }
+        }
     }
 
     std::vector<double> union_values;
@@ -79,23 +108,29 @@ MergeAndPruneResult merge_and_prune(
     }
     for (const auto& [pid, part] : child_partitions) {
         (void)pid;
-        union_values.push_back(part.total_sum);  // SUM UB
+        union_values.push_back(part.upper_bound(agg_type));
     }
 
-    const double top_k_bound = kth_highest_or_zero(union_values, k);
+    const double top_k_bound = kth_bound_for_exact(union_values, k, agg_type);
 
     size_t top_k_confirmed = 0;
     for (const auto& [gid, exact] : exact_aggregates) {
         (void)gid;
-        if (exact > top_k_bound) ++top_k_confirmed;
+        if (agg_type == AggregateType::MIN) {
+            if (exact < top_k_bound) ++top_k_confirmed;
+        } else {
+            if (exact > top_k_bound) ++top_k_confirmed;
+        }
     }
 
     ChildPartitions surviving;
     surviving.reserve(child_partitions.size());
     for (const auto& [pid, part] : child_partitions) {
-        if (part.total_sum >= top_k_bound) {
-            surviving.emplace(pid, part);
-        }
+        const double ub = part.upper_bound(agg_type);
+        bool keep = (agg_type == AggregateType::MIN)
+                    ? (ub <= top_k_bound)
+                    : (ub >= top_k_bound);
+        if (keep) surviving.emplace(pid, part);
     }
 
     MergeAndPruneResult result;
@@ -108,20 +143,100 @@ MergeAndPruneResult merge_and_prune(
 
 std::vector<std::pair<uint64_t, double>> top_k_from_exact(
     const ExactAggregates& exact_aggregates,
-    size_t k)
+    size_t k,
+    AggregateType agg_type = AggregateType::SUM)
 {
     std::vector<std::pair<uint64_t, double>> all(exact_aggregates.begin(), exact_aggregates.end());
     const size_t n = std::min(k, all.size());
     if (n > 0) {
-        std::partial_sort(
-            all.begin(), all.begin() + n, all.end(),
-            [](const auto& a, const auto& b) {
-                if (a.second != b.second) return a.second > b.second;
-                return a.first < b.first;
-            });
+        if (agg_type == AggregateType::MIN) {
+            std::partial_sort(all.begin(), all.begin() + n, all.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
+        } else {
+            std::partial_sort(all.begin(), all.begin() + n, all.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second > b.second;
+                    return a.first < b.first;
+                });
+        }
     }
     all.resize(n);
     return all;
+}
+
+// ── Algorithm 3 helpers ────────────────────────────────────────────────────
+
+// Segment-based locality score: l = (1/t) * Σ d_s/c_s
+// Paper §4.3, patent defaults: segment_size=100k, α₀=0.20.
+// d_s = distinct group_ids among active-partition rows in segment,
+// c_s = total active-partition rows in segment.
+// Low l → rows clustered by group → physical partitioning is beneficial.
+double compute_locality(
+    const std::vector<Row>& dataset,
+    const std::unordered_set<size_t>& active_pid_set,
+    size_t n_partitions,
+    int level,
+    size_t segment_size)
+{
+    if (dataset.empty() || active_pid_set.empty()) return 1.0;
+
+    double sum_ratio = 0.0;
+    size_t n_segments = 0;
+
+    std::unordered_set<uint64_t> seg_groups;
+    seg_groups.reserve(segment_size / 4);
+    size_t seg_active_rows = 0;
+    size_t row_in_seg = 0;
+
+    auto flush_segment = [&]() {
+        if (seg_active_rows > 0) {
+            sum_ratio += static_cast<double>(seg_groups.size())
+                       / static_cast<double>(seg_active_rows);
+            ++n_segments;
+        }
+        seg_groups.clear();
+        seg_active_rows = 0;
+    };
+
+    for (const auto& row : dataset) {
+        const size_t pid = partition_id_for_level(row.group_id, n_partitions, level - 1);
+        if (active_pid_set.count(pid) > 0) {
+            seg_groups.insert(row.group_id);
+            ++seg_active_rows;
+        }
+        if (++row_in_seg == segment_size) {
+            flush_segment();
+            row_in_seg = 0;
+        }
+    }
+    flush_segment();  // tail segment
+
+    return (n_segments == 0) ? 1.0 : sum_ratio / static_cast<double>(n_segments);
+}
+
+// Physical partitioning: one pass over the dataset, routing each non-FA row
+// whose parent partition is in active_pid_set into a per-partition buffer.
+// Returns map<partition_id, vector<Row>> for the surviving partitions.
+std::unordered_map<size_t, std::vector<Row>> physical_partition_rows(
+    const std::vector<Row>& dataset,
+    const FATable& fa,
+    const std::unordered_set<size_t>& active_pid_set,
+    size_t n_partitions,
+    int level)
+{
+    std::unordered_map<size_t, std::vector<Row>> buffers;
+    buffers.reserve(active_pid_set.size());
+
+    for (const auto& row : dataset) {
+        if (fa.contains(row.group_id)) continue;
+        const size_t pid = partition_id_for_level(row.group_id, n_partitions, level - 1);
+        if (active_pid_set.count(pid) == 0) continue;
+        buffers[pid].push_back(row);
+    }
+    return buffers;
 }
 
 }  // namespace
@@ -190,7 +305,8 @@ RunMetrics run_zippy_baseline(
         cfg.delta,
         cfg.alpha_ci,
         cfg.beta_ci,
-        42);
+        42,
+        k_size);
     metrics.sample_duration_ms = sample_timer.elapsed_ms();
     metrics.sample_size_actual = sample.sample_size_actual;
     metrics.fa_candidates_count = sample.fa_groups.size();
@@ -202,10 +318,17 @@ RunMetrics run_zippy_baseline(
         return metrics;
     }
 
-    // Pass 1 (Phase 4B): FA/CA routing + pruning with k-th FA value.
+    // Pass 1 (Phase 4B): FA/CA routing + pruning.
+    // FA identity: 0 for SUM/COUNT, lowest() for MAX, max() for MIN.
+    const double fa_identity = (cfg.agg_type == AggregateType::MAX)
+        ? std::numeric_limits<double>::lowest()
+        : (cfg.agg_type == AggregateType::MIN)
+            ? std::numeric_limits<double>::max()
+            : 0.0;
+
     FATable fa(cfg.fa_capacity);
     for (uint64_t gid : sample.fa_groups) {
-        fa.insert(gid);
+        fa.insert(gid, fa_identity);
     }
 
     out_fa_groups = fa.all_group_ids();
@@ -218,21 +341,29 @@ RunMetrics run_zippy_baseline(
     for (const auto& row : dataset) {
         assert(row.group_id != FA_EMPTY_KEY && "group_id must not equal FA sentinel key");
         if (fa.contains(row.group_id)) {
-            fa.update(row.group_id, row.value);
+            fa.update(row.group_id, row.value, cfg.agg_type);
         } else {
             ca.update(row.group_id, row.value);
         }
     }
 
-    out_results = fa.top_k(k_size);  // temporary, replaced after Phase 4C loop
+    out_results = fa.top_k(k_size, cfg.agg_type);  // temporary, replaced after Phase 4C loop
 
-    // topKBound: k-th largest FA value; if fewer than k values, keep bound at 0.
+    // topKBound: k-th highest of {FA exact values ∪ CA partition UBs}.
+    // Using only FA values under-prunes vs Algorithm 4 line 12 of the paper.
     double topKBound = 0.0;
-    if (k_size > 0 && out_results.size() >= k_size) {
-        topKBound = out_results[k_size - 1].second;
+    {
+        std::vector<double> union_vals;
+        union_vals.reserve(out_fa_groups.size() + ca.n_partitions());
+        for (uint64_t gid : out_fa_groups)
+            union_vals.push_back(fa.get(gid));
+        for (size_t pid = 0; pid < ca.n_partitions(); ++pid)
+            if (ca.partition(pid).count > 0)
+                union_vals.push_back(ca.partition(pid).upper_bound(cfg.agg_type));
+        topKBound = kth_bound_for_exact(union_vals, k_size, cfg.agg_type);
     }
 
-    ca.prune(topKBound);
+    ca.prune(topKBound, cfg.agg_type);
 
     metrics.pass1_duration_ms = pass1_timer.elapsed_ms();
     metrics.topKBound_after_pass1 = topKBound;
@@ -273,12 +404,42 @@ RunMetrics run_zippy_baseline(
 
     while (!done && !active_partitions.empty()) {
         std::unordered_set<size_t> exact_parent_ids;
+        std::unordered_set<size_t> active_pid_set;
         exact_parent_ids.reserve(active_partitions.size());
+        active_pid_set.reserve(active_partitions.size());
         for (const auto& [pid, part] : active_partitions) {
-            (void)pid;
+            active_pid_set.insert(pid);
             if (static_cast<size_t>(part.fm.estimate()) < cfg.fa_capacity) {
                 exact_parent_ids.insert(pid);
             }
+        }
+
+        // Algorithm 3: decide logical vs physical partitioning.
+        // Locality score l = (1/t)*Σ d_s/c_s; if l < α₀ → physical.
+        // Also apply C_p/Q < T_c check (patent claims 3/4, 13/14).
+        const double locality = compute_locality(
+            dataset, active_pid_set, cfg.n_partitions, level, cfg.locality_segment_size);
+
+        // C_p/Q < T_c: C_p = total estimated distinct groups, Q = #active partitions,
+        // T_c = min FA exact aggregate (lowest confirmed top-k threshold).
+        double T_c = std::numeric_limits<double>::max();
+        for (uint64_t gid : out_fa_groups) {
+            const double v = fa.get(gid);
+            if (v < T_c) T_c = v;
+        }
+        double C_p = 0.0;
+        for (const auto& [pid, part] : active_partitions) {
+            (void)pid;
+            C_p += static_cast<double>(part.fm.estimate());
+        }
+        const double Q = static_cast<double>(active_partitions.size());
+        const bool cp_q_logical = (Q > 0.0) && ((C_p / Q) < T_c);
+        const bool use_physical = (locality < cfg.locality_threshold) && !cp_q_logical;
+
+        if (cfg.verbose) {
+            std::fprintf(stderr,
+                "[baseline-pass%d] locality=%.3f use_physical=%s C_p/Q=%.1f T_c=%.3f\n",
+                level, locality, use_physical ? "yes" : "no", Q > 0 ? C_p/Q : 0.0, T_c);
         }
 
         PartialAggregates partial;
@@ -288,28 +449,48 @@ RunMetrics run_zippy_baseline(
 
         Timer pass_timer;
         pass_timer.reset();
-        for (const auto& row : dataset) {
-            if (fa.contains(row.group_id)) {
-                continue;  // FA groups are already exact after Pass 1.
-            }
 
-            if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history)) {
-                continue;
-            }
-
+        auto accumulate_row = [&](const Row& row) {
             const size_t parent_id = partition_id_for_level(row.group_id, cfg.n_partitions, level - 1);
             if (exact_parent_ids.count(parent_id) > 0) {
-                partial[row.group_id] += row.value;
+                auto [it, inserted] = partial.emplace(row.group_id, fa_identity);
+                switch (cfg.agg_type) {
+                    case AggregateType::SUM:   it->second += row.value; break;
+                    case AggregateType::COUNT: it->second += 1.0; break;
+                    case AggregateType::MAX:   if (row.value > it->second) it->second = row.value; break;
+                    case AggregateType::MIN:   if (row.value < it->second) it->second = row.value; break;
+                }
             } else {
                 const size_t child_id = partition_id_for_level(row.group_id, cfg.n_partitions, level);
                 update_partition_from_row(children[child_id], row.group_id, row.value);
             }
+        };
+
+        if (use_physical) {
+            // Physical partitioning: pre-partition rows into per-partition buffers,
+            // then process each buffer sequentially for better cache locality.
+            auto buffers = physical_partition_rows(
+                dataset, fa, active_pid_set, cfg.n_partitions, level);
+            for (auto& [pid, buf] : buffers) {
+                (void)pid;
+                for (const auto& row : buf) {
+                    accumulate_row(row);
+                }
+            }
+        } else {
+            // Logical partitioning: single full-dataset scan with row filtering.
+            for (const auto& row : dataset) {
+                if (fa.contains(row.group_id)) continue;
+                if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history)) continue;
+                accumulate_row(row);
+            }
         }
+
         metrics.pass2plus_duration_ms += pass_timer.elapsed_ms();
         metrics.total_passes += 1;
 
         const MergeAndPruneResult merged =
-            merge_and_prune(exact_aggregates, partial, children, k_size);
+            merge_and_prune(exact_aggregates, partial, children, k_size, cfg.agg_type);
         done = merged.done;
         if (done) break;
 
@@ -326,7 +507,7 @@ RunMetrics run_zippy_baseline(
         ++level;
     }
 
-    out_results = top_k_from_exact(exact_aggregates, k_size);
+    out_results = top_k_from_exact(exact_aggregates, k_size, cfg.agg_type);
     metrics.total_duration_ms = total_timer.elapsed_ms();
 
     return metrics;
