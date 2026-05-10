@@ -330,17 +330,7 @@ RunMetrics run_zippy_baseline(
         active_partitions.emplace(pid, ca.partition(pid));
     }
 
-    if (cfg.verbose) {
-        std::fprintf(stderr,
-                     "[baseline-pass1] agg=%s topKBound=%.6f pruned=%.2f%% "
-                     "survivors=%zu L_k=%.6f Cs=%zu\n",
-                     agg_func_name(cfg.agg_func),
-                     metrics.topKBound_after_pass1,
-                     metrics.partitions_pruned_pct * 100.0,
-                     active_partitions.size(),
-                     metrics.l_k_lower_bound,
-                     metrics.cs_above_lk);
-    }
+
 
     // ── Pass 2+: MergeAndPrune + adaptive partitioning ───────────────────
     int level = 2;
