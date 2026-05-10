@@ -96,8 +96,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "ERROR: ext-a mode not yet implemented (Phase 5)\n");
         return 1;
     } else if (mode == "ext-b") {
-        fprintf(stderr, "ERROR: ext-b mode not yet implemented (Phase 6)\n");
-        return 1;
+        metrics = run_zippy_ext_b(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-ab") {
         fprintf(stderr, "ERROR: ext-ab mode not yet implemented (Phase 7)\n");
         return 1;
