@@ -12,11 +12,17 @@
 
 struct ZippyConfig {
     size_t fa_capacity      = 50000;   // groups FA can hold
-    size_t n_partitions     = 10000;   // CA logical partition count
+    size_t n_partitions     = 10000;   // CA logical partition count (= Q in patent)
     double sample_frac      = 0.01;    // uniform sample fraction
     double delta            = 0.05;    // sampling tolerance Δ
     double alpha_ci         = 0.05;    // CI confidence for sample size
     double beta_ci          = 0.95;    // Hoeffding CI confidence
+    // Aggregate function (paper §2: monotonic SUM / COUNT / MAX / MIN, Y ≥ 0)
+    AggFunc agg_func          = AggFunc::SUM;
+    // Adaptive partitioning constants (patent description col. 11; defaults
+    // s = 100k, α₀ = 0.20 from the patent's benchmarking).
+    size_t  segment_size      = 100000;
+    double  alpha_locality    = 0.20;
     // Extension A
     double underrep_threshold = 0.5;
     size_t boost_rows         = 10;
@@ -27,10 +33,10 @@ struct ZippyConfig {
     bool   verbose            = false;
 };
 
-// Brute-force reference (always correct, used for verification)
-// Single pass: unordered_map aggregate, then partial_sort to find top-k.
+// Brute-force reference (always correct, used for verification).
+// Single pass with multi-aggregate accumulation; selects top-k by `agg_func`.
 std::vector<std::pair<uint64_t,double>> run_brute_force(
-    const std::vector<Row>& dataset, int k);
+    const std::vector<Row>& dataset, int k, AggFunc agg_func = AggFunc::SUM);
 
 // Baseline Zippy: Algorithm 2 sampling + Pass 1 routing/pruning + Phase 4C multi-pass loop.
 RunMetrics run_zippy_baseline(

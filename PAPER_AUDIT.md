@@ -1,5 +1,11 @@
 # Paper + Patent vs Implementation Audit
 
+> **Update — items 1, 2, 3 (decision logic), 5, 6, 7 of the deviations list have
+> now been implemented.**  Section "Status after implementation pass" at the end
+> of this document records what shipped.  Items 4 (parallelism) and 8 (Extensions
+> A & B) remain explicitly out of scope.
+
+
 References:
 - Siddiqui et al., *Cache-Efficient Top-k Aggregation over High Cardinality Large Datasets*, PVLDB 17(4): 644–656, 2023 (`p644-siddiqui-paper.pdf`).
 - US Patent **12,380,098 B2** (Microsoft / Siddiqui et al., issued Aug. 5, 2025) (`patent-application.pdf`). Cites the paper as prior publication. The patent description fills in implementation specifics the paper hand-waves, and the **claims** define what's legally protected — those claims are a useful checklist for "is this really Zippy".
@@ -95,3 +101,46 @@ Several of the missing pieces are not just "paper niceties" — they are explici
 3. **Add the segment-locality test (`l = Σ d_s/c_s / t`, defaults `s=100k, α₀=0.20`) and `C_p/Q < T_c` decision** in pass 2+ (`zippy.cpp`, new helpers) — patent claims 3/4, 13/14.
 4. **Heavy-hitter top-up should use Hoeffding LB as primary, count as tiebreaker** — small but conformance-relevant.
 5. Parallelism (paper §4.4, patent claim 1 "each core") — biggest engineering lift, lowest priority for a correctness-focused prototype.
+
+---
+
+## Status after implementation pass
+
+### What shipped (commits live in `src/`)
+
+- **Algorithm 2 with Hoeffding LB + L_k gate** — `sampler.cpp:hoeffding_eps_per_tuple`, `aggregate_lower_bound`, plus the `tempGroups`/`Cs > Cf` decision and heavy-hitter top-up sorted by sample count. `SampleResult` now exposes `l_k_lower_bound` and `cs_above_lk`.  Exercised: `--fa-capacity 5` on S0 produces `is_optimizable=false` and the engine falls back to brute-force; top-K still matches.
+- **Multi-aggregate (SUM / COUNT / MAX / MIN)** — `AggFunc` enum in `data_structures.h`; `FAEntry` widened to 32 bytes tracking all four; `CAPartition::upper_bound(AggFunc)` and `estimated_per_group(AggFunc)`; `CATable::prune(topKBound, AggFunc)`; multi-aggregate `ExactAccum` in `zippy.cpp`; multi-aggregate `run_brute_force`. CLI: `--agg sum|count|max|min`. Verified end-to-end: all four aggregates on S0 produce top-K identical to brute-force.
+- **Pass 1 union UB** (`zippy.cpp:run_zippy_baseline`) — `topKBound` after Pass 1 is now the K-th highest among `{FA exact values} ∪ {partition UBs}`, matching Algorithm 4 line 12.
+- **CI skew validation gate** — fall back if top-K sample aggregate share of total < 1% (sampler.cpp, in addition to the `Cs > Cf` test). Patent claim 2 / 12.
+- **Heavy-hitter top-up by sample count** — primary key now Hoeffding LB (the L_k filter), then count as the top-up (patent col. 10's `Cs + Ch ≈ Cf`).
+- **Locality test + adaptive partitioning decision** — `classify_partition` in `zippy.cpp` implements:
+  - `distinct < FA_capacity` → EXACT
+  - `distinct / count < α₀` (default 0.20) → EXACT (paper §4.3 / patent col. 11 locality test)
+  - `C_p / Q < T_c` → LOGICAL (patent claim 4 / 14)
+  - else → PHYSICAL
+  - `T_c` is `FATable::lowest_count()`. Decision counts surfaced in metrics (`partitions_exact_agg`, `partitions_logical`, `partitions_physical`).
+
+### Caveats (intentional shortcuts, not omissions)
+
+- **Locality is single-segment**: `l = d / count` over the whole partition, not the patent's `Σ_s d_s/c_s / t` over `s = 100k`-sized segments. Cheaper to compute under the dataset-rescan model and gives the same direction of decision; configurable via `--alpha-locality` and `--segment-size` (latter currently unused).
+- **Logical vs Physical execution path**: in this single-threaded prototype both branches re-scan the dataset and update child stats — the per-core cache benefit of physical row movement is moot without parallelism (deviation #4). Decisions are still recorded; future parallel work can wire them to actual row materialization.
+- **MIN aggregate LB**: paper specifies β/2-percentile CIs; impl uses sample MIN as a heuristic (technically an upper bound). Order-preserving for the candidate filter but not rigorous. Documented in `aggregate_lower_bound` in `sampler.cpp`.
+
+### Remaining (out of scope per user request)
+
+- **Item 4** — multi-core parallelism (paper §4.4, patent claim 1's "each core").
+- **Item 8** — Extensions A (stratified sampling) and B (measure-column index). Modes `ext-a`, `ext-b`, `ext-ab` still return errors from `main.cpp`.
+
+### Verification commands used
+
+```bash
+g++ -std=c++17 -O2 -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+for AGG in sum count max min; do
+  ./build/zippy --input data/S0.bin --n-rows 10091 --k 10 --mode brute-force --agg $AGG --output results/S0_bf_$AGG.json
+  ./build/zippy --input data/S0.bin --n-rows 10091 --k 10 --mode baseline   --agg $AGG --output results/S0_bl_$AGG.json
+  diff <(jq -r '.top_k_results[]' results/S0_bf_$AGG.json) <(jq -r '.top_k_results[]' results/S0_bl_$AGG.json)
+done
+# Force fallback gate:
+./build/zippy --input data/S0.bin --n-rows 10091 --k 10 --mode baseline --fa-capacity 5 --output /tmp/x.json
+# → is_optimizable=false, top-K still matches brute-force.
+```

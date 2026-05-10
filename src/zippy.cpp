@@ -1,7 +1,9 @@
 // zippy.cpp — Core Zippy engine implementation.
 //
-// Phase 4C: brute-force + baseline multi-pass convergence are implemented.
-// Phases 5–7 will add extension modes.
+// Implements: Algorithm 1 framework, Algorithm 2 sampling+candidate selection
+// (Hoeffding LB + L_k via sampler.cpp), Algorithm 3 routing with locality test
+// + logical/physical decision (patent claims 3, 4, 13, 14), Algorithm 4
+// MergeAndPrune with multi-aggregate UBs (patent description col. 13).
 
 #include "zippy.h"
 #include "sampler.h"
@@ -16,14 +18,43 @@
 
 namespace {
 
-using ExactAggregates = std::unordered_map<uint64_t, double>;
-using PartialAggregates = std::unordered_map<uint64_t, double>;
-using ChildPartitions = std::unordered_map<size_t, CAPartition>;
+struct ExactAccum {
+    double   sum   = 0.0;
+    uint64_t count = 0;
+    double   max_v = std::numeric_limits<double>::lowest();
+    double   min_v = std::numeric_limits<double>::max();
+
+    void update(double v) {
+        sum   += v;
+        count += 1;
+        if (v > max_v) max_v = v;
+        if (v < min_v) min_v = v;
+    }
+    double value(AggFunc f) const {
+        switch (f) {
+            case AggFunc::SUM:   return sum;
+            case AggFunc::COUNT: return static_cast<double>(count);
+            case AggFunc::MAX:   return max_v;
+            case AggFunc::MIN:   return min_v;
+        }
+        return sum;
+    }
+    void merge(const ExactAccum& o) {
+        sum   += o.sum;
+        count += o.count;
+        if (o.max_v > max_v) max_v = o.max_v;
+        if (o.min_v < min_v) min_v = o.min_v;
+    }
+};
+
+using ExactAggregates  = std::unordered_map<uint64_t, ExactAccum>;
+using PartialAggregates = std::unordered_map<uint64_t, ExactAccum>;
+using ChildPartitions   = std::unordered_map<size_t, CAPartition>;
 
 struct MergeAndPruneResult {
     double top_k_bound = 0.0;
     size_t top_k_confirmed = 0;
-    bool done = false;
+    bool   done = false;
     ChildPartitions surviving_partitions;
 };
 
@@ -61,39 +92,67 @@ bool row_in_active_path(
     return true;
 }
 
+// Algorithm 3 lines 5–13 + patent claim 4: classify a parent partition for the
+// next pass as one of:
+//   EXACT   — distinct < FA capacity, OR locality d/c < α₀
+//   LOGICAL — C_p / Q < T_c   (statistics-only routing; no row movement)
+//   PHYSICAL — otherwise      (would move rows; metric-only in this prototype)
+enum class PartitionDecision { EXACT, LOGICAL, PHYSICAL };
+
+PartitionDecision classify_partition(
+    const CAPartition& part,
+    const ZippyConfig& cfg,
+    uint64_t t_c)
+{
+    const uint32_t d = part.fm.estimate();
+    if (d < cfg.fa_capacity) return PartitionDecision::EXACT;
+
+    if (part.count > 0) {
+        const double locality = static_cast<double>(d) / static_cast<double>(part.count);
+        if (locality < cfg.alpha_locality) return PartitionDecision::EXACT;
+    }
+
+    // Patent claim 4 / 14: C_p / Q < T_c ⇒ logical, else physical.
+    if (cfg.n_partitions == 0 || t_c == 0) return PartitionDecision::LOGICAL;
+    const double e = static_cast<double>(part.count) / static_cast<double>(cfg.n_partitions);
+    if (e < static_cast<double>(t_c)) return PartitionDecision::LOGICAL;
+    return PartitionDecision::PHYSICAL;
+}
+
 MergeAndPruneResult merge_and_prune(
     ExactAggregates& exact_aggregates,
     const PartialAggregates& partial_aggregates,
     const ChildPartitions& child_partitions,
-    size_t k)
+    size_t k,
+    AggFunc agg)
 {
-    for (const auto& [gid, val] : partial_aggregates) {
-        exact_aggregates[gid] += val;
+    for (const auto& [gid, acc] : partial_aggregates) {
+        exact_aggregates[gid].merge(acc);
     }
 
     std::vector<double> union_values;
     union_values.reserve(exact_aggregates.size() + child_partitions.size());
-    for (const auto& [gid, exact] : exact_aggregates) {
+    for (const auto& [gid, acc] : exact_aggregates) {
         (void)gid;
-        union_values.push_back(exact);
+        union_values.push_back(acc.value(agg));
     }
     for (const auto& [pid, part] : child_partitions) {
         (void)pid;
-        union_values.push_back(part.total_sum);  // SUM UB
+        union_values.push_back(part.upper_bound(agg));
     }
 
     const double top_k_bound = kth_highest_or_zero(union_values, k);
 
     size_t top_k_confirmed = 0;
-    for (const auto& [gid, exact] : exact_aggregates) {
+    for (const auto& [gid, acc] : exact_aggregates) {
         (void)gid;
-        if (exact > top_k_bound) ++top_k_confirmed;
+        if (acc.value(agg) > top_k_bound) ++top_k_confirmed;
     }
 
     ChildPartitions surviving;
     surviving.reserve(child_partitions.size());
     for (const auto& [pid, part] : child_partitions) {
-        if (part.total_sum >= top_k_bound) {
+        if (part.upper_bound(agg) >= top_k_bound) {
             surviving.emplace(pid, part);
         }
     }
@@ -108,9 +167,14 @@ MergeAndPruneResult merge_and_prune(
 
 std::vector<std::pair<uint64_t, double>> top_k_from_exact(
     const ExactAggregates& exact_aggregates,
-    size_t k)
+    size_t k,
+    AggFunc agg)
 {
-    std::vector<std::pair<uint64_t, double>> all(exact_aggregates.begin(), exact_aggregates.end());
+    std::vector<std::pair<uint64_t, double>> all;
+    all.reserve(exact_aggregates.size());
+    for (const auto& [gid, acc] : exact_aggregates) {
+        all.emplace_back(gid, acc.value(agg));
+    }
     const size_t n = std::min(k, all.size());
     if (n > 0) {
         std::partial_sort(
@@ -127,24 +191,21 @@ std::vector<std::pair<uint64_t, double>> top_k_from_exact(
 }  // namespace
 
 // ── Brute-force baseline ───────────────────────────────────────────────────
-// Computes exact aggregates for every group in one pass, then selects the
-// top-k by aggregate value using partial_sort. This is the ground-truth
-// comparator — it does NOT use FA/CA and is always correct regardless of
-// data distribution.
-//
-// See AGENTS.md Section 7 "Brute-Force Mode Implementation".
-
+// One-pass exact aggregation for every group, then partial_sort to pick top-k
+// by `agg_func`. Always correct — used as the ground-truth comparator.
 std::vector<std::pair<uint64_t,double>> run_brute_force(
-    const std::vector<Row>& dataset, int k)
+    const std::vector<Row>& dataset, int k, AggFunc agg_func)
 {
-    // One-pass exact aggregation over all groups
-    std::unordered_map<uint64_t, double> agg;
-    agg.reserve(dataset.size() / 10);  // rough capacity hint
+    std::unordered_map<uint64_t, ExactAccum> agg;
+    agg.reserve(dataset.size() / 10);
     for (const auto& row : dataset)
-        agg[row.group_id] += row.value;
+        agg[row.group_id].update(row.value);
 
-    // Partial sort: find top-k without fully sorting all M groups
-    std::vector<std::pair<uint64_t,double>> all(agg.begin(), agg.end());
+    std::vector<std::pair<uint64_t,double>> all;
+    all.reserve(agg.size());
+    for (const auto& [gid, acc] : agg)
+        all.emplace_back(gid, acc.value(agg_func));
+
     size_t n = static_cast<size_t>(k);
     if (n > all.size()) n = all.size();
 
@@ -180,12 +241,14 @@ RunMetrics run_zippy_baseline(
         return metrics;
     }
 
-    // Algorithm 2 (simplified): uniform sampling + FA candidate selection.
+    // ── Algorithm 2: sampling + Hoeffding LB + L_k candidate selection ───
     Timer sample_timer;
     sample_timer.reset();
     const SampleResult sample = uniform_sample_and_select(
         dataset,
         cfg.fa_capacity,
+        k,
+        cfg.agg_func,
         cfg.sample_frac,
         cfg.delta,
         cfg.alpha_ci,
@@ -195,18 +258,19 @@ RunMetrics run_zippy_baseline(
     metrics.sample_size_actual = sample.sample_size_actual;
     metrics.fa_candidates_count = sample.fa_groups.size();
     metrics.is_optimizable = sample.is_optimizable;
+    metrics.l_k_lower_bound = sample.l_k_lower_bound;
+    metrics.cs_above_lk = sample.cs_above_lk;
 
     if (!sample.is_optimizable) {
-        out_results = run_brute_force(dataset, k);
+        // Algorithm 1 line 14: fall back to baseline aggregation.
+        out_results = run_brute_force(dataset, k, cfg.agg_func);
         metrics.total_duration_ms = total_timer.elapsed_ms();
         return metrics;
     }
 
-    // Pass 1 (Phase 4B): FA/CA routing + pruning with k-th FA value.
+    // ── Pass 1: FA / CA routing ──────────────────────────────────────────
     FATable fa(cfg.fa_capacity);
-    for (uint64_t gid : sample.fa_groups) {
-        fa.insert(gid);
-    }
+    for (uint64_t gid : sample.fa_groups) fa.insert(gid);
 
     out_fa_groups = fa.all_group_ids();
     std::sort(out_fa_groups.begin(), out_fa_groups.end());
@@ -224,15 +288,24 @@ RunMetrics run_zippy_baseline(
         }
     }
 
-    out_results = fa.top_k(k_size);  // temporary, replaced after Phase 4C loop
-
-    // topKBound: k-th largest FA value; if fewer than k values, keep bound at 0.
-    double topKBound = 0.0;
-    if (k_size > 0 && out_results.size() >= k_size) {
-        topKBound = out_results[k_size - 1].second;
+    // Pass 1 top-K bound: K-th highest among {FA exact values} ∪ {partition UBs}
+    // (Algorithm 4 line 12 — paper / patent require the union, not FA-only).
+    std::vector<double> pass1_union;
+    pass1_union.reserve(fa.size() + cfg.n_partitions);
+    {
+        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        for (const auto& [gid, val] : fa_all) {
+            (void)gid;
+            pass1_union.push_back(val);
+        }
+        for (size_t pid = 0; pid < cfg.n_partitions; ++pid) {
+            const CAPartition& part = ca.partition(pid);
+            if (part.count > 0) pass1_union.push_back(part.upper_bound(cfg.agg_func));
+        }
     }
+    const double topKBound = kth_highest_or_zero(pass1_union, k_size);
 
-    ca.prune(topKBound);
+    ca.prune(topKBound, cfg.agg_func);
 
     metrics.pass1_duration_ms = pass1_timer.elapsed_ms();
     metrics.topKBound_after_pass1 = topKBound;
@@ -242,7 +315,12 @@ RunMetrics run_zippy_baseline(
     ExactAggregates exact_aggregates;
     exact_aggregates.reserve(std::max<size_t>(fa.size() * 2, 1));
     for (uint64_t gid : out_fa_groups) {
-        exact_aggregates[gid] = fa.get(gid);
+        ExactAccum acc;
+        acc.sum   = fa.get(gid, AggFunc::SUM);
+        acc.count = static_cast<uint64_t>(fa.get(gid, AggFunc::COUNT));
+        acc.max_v = fa.get(gid, AggFunc::MAX);
+        acc.min_v = fa.get(gid, AggFunc::MIN);
+        exact_aggregates[gid] = acc;
     }
 
     std::vector<std::unordered_set<size_t>> active_history(2);  // index 0 unused
@@ -254,53 +332,61 @@ RunMetrics run_zippy_baseline(
 
     if (cfg.verbose) {
         std::fprintf(stderr,
-                     "[baseline-pass1] topKBound=%.6f pruned=%.2f%% survivors=%zu\n",
+                     "[baseline-pass1] agg=%s topKBound=%.6f pruned=%.2f%% "
+                     "survivors=%zu L_k=%.6f Cs=%zu\n",
+                     agg_func_name(cfg.agg_func),
                      metrics.topKBound_after_pass1,
                      metrics.partitions_pruned_pct * 100.0,
-                     active_partitions.size());
-        std::fprintf(stderr, "[baseline-pass1] FA candidates (%zu): ", out_fa_groups.size());
-        for (size_t i = 0; i < out_fa_groups.size(); ++i) {
-            std::fprintf(stderr,
-                         "%llu%s",
-                         static_cast<unsigned long long>(out_fa_groups[i]),
-                         (i + 1 < out_fa_groups.size()) ? "," : "\n");
-        }
+                     active_partitions.size(),
+                     metrics.l_k_lower_bound,
+                     metrics.cs_above_lk);
     }
 
-    // Phase 4C: MergeAndPrune + multi-pass loop.
-    int level = 2;  // Pass 2 children are hashed with child_partition_hash(..., pass=2).
+    // ── Pass 2+: MergeAndPrune + adaptive partitioning ───────────────────
+    int level = 2;
     bool done = active_partitions.empty();
 
     while (!done && !active_partitions.empty()) {
-        std::unordered_set<size_t> exact_parent_ids;
-        exact_parent_ids.reserve(active_partitions.size());
+        // Algorithm 3 lines 5–24 / patent claims 3, 4, 13, 14: classify each
+        // parent partition for this pass.
+        const uint64_t t_c = fa.lowest_count();
+        std::unordered_map<size_t, PartitionDecision> decisions;
+        decisions.reserve(active_partitions.size());
+        size_t pass_exact = 0, pass_logical = 0, pass_physical = 0;
         for (const auto& [pid, part] : active_partitions) {
-            (void)pid;
-            if (static_cast<size_t>(part.fm.estimate()) < cfg.fa_capacity) {
-                exact_parent_ids.insert(pid);
+            const PartitionDecision d = classify_partition(part, cfg, t_c);
+            decisions[pid] = d;
+            switch (d) {
+                case PartitionDecision::EXACT:    ++pass_exact;    break;
+                case PartitionDecision::LOGICAL:  ++pass_logical;  break;
+                case PartitionDecision::PHYSICAL: ++pass_physical; break;
             }
         }
+        metrics.partitions_exact_agg += pass_exact;
+        metrics.partitions_logical   += pass_logical;
+        metrics.partitions_physical  += pass_physical;
 
         PartialAggregates partial;
-        ChildPartitions children;
+        ChildPartitions   children;
         partial.reserve(4096);
         children.reserve(active_partitions.size());
 
         Timer pass_timer;
         pass_timer.reset();
         for (const auto& row : dataset) {
-            if (fa.contains(row.group_id)) {
-                continue;  // FA groups are already exact after Pass 1.
-            }
-
-            if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history)) {
+            if (fa.contains(row.group_id)) continue;  // FA groups already exact
+            if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history))
                 continue;
-            }
 
             const size_t parent_id = partition_id_for_level(row.group_id, cfg.n_partitions, level - 1);
-            if (exact_parent_ids.count(parent_id) > 0) {
-                partial[row.group_id] += row.value;
+            const auto it = decisions.find(parent_id);
+            if (it == decisions.end()) continue;
+
+            if (it->second == PartitionDecision::EXACT) {
+                partial[row.group_id].update(row.value);
             } else {
+                // LOGICAL or PHYSICAL: same execution path in this prototype
+                // (single-threaded — physical row movement provides no speedup).
                 const size_t child_id = partition_id_for_level(row.group_id, cfg.n_partitions, level);
                 update_partition_from_row(children[child_id], row.group_id, row.value);
             }
@@ -309,8 +395,18 @@ RunMetrics run_zippy_baseline(
         metrics.total_passes += 1;
 
         const MergeAndPruneResult merged =
-            merge_and_prune(exact_aggregates, partial, children, k_size);
+            merge_and_prune(exact_aggregates, partial, children, k_size, cfg.agg_func);
         done = merged.done;
+        if (cfg.verbose) {
+            std::fprintf(stderr,
+                         "[baseline-pass%d] exact=%zu logical=%zu physical=%zu "
+                         "topKBound=%.6f survivors=%zu confirmed=%zu\n",
+                         metrics.total_passes,
+                         pass_exact, pass_logical, pass_physical,
+                         merged.top_k_bound,
+                         merged.surviving_partitions.size(),
+                         merged.top_k_confirmed);
+        }
         if (done) break;
 
         active_partitions = merged.surviving_partitions;
@@ -326,7 +422,7 @@ RunMetrics run_zippy_baseline(
         ++level;
     }
 
-    out_results = top_k_from_exact(exact_aggregates, k_size);
+    out_results = top_k_from_exact(exact_aggregates, k_size, cfg.agg_func);
     metrics.total_duration_ms = total_timer.elapsed_ms();
 
     return metrics;

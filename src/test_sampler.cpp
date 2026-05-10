@@ -79,6 +79,8 @@ int main()
     const SampleResult sample = uniform_sample_and_select(
         dataset,
         FA_CAPACITY,
+        /*k=*/10,
+        AggFunc::SUM,
         0.01,
         0.05,
         0.05,

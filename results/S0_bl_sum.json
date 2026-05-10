@@ -1,0 +1,37 @@
+{
+  "mode": "baseline",
+  "k": 10,
+  "n_rows": 10091,
+  "n_groups": 0,
+  "top_k_results": [
+    {"group_id": 0, "aggregate": 174484.790032},
+    {"group_id": 1, "aggregate": 82221.321351},
+    {"group_id": 2, "aggregate": 48435.121448},
+    {"group_id": 3, "aggregate": 35269.698673},
+    {"group_id": 507, "aggregate": 30000.000000},
+    {"group_id": 508, "aggregate": 30000.000000},
+    {"group_id": 514, "aggregate": 30000.000000},
+    {"group_id": 515, "aggregate": 30000.000000},
+    {"group_id": 520, "aggregate": 30000.000000},
+    {"group_id": 525, "aggregate": 30000.000000}
+  ],
+  "metrics": {
+    "is_optimizable": true,
+    "total_passes": 2,
+    "sample_size_actual": 361,
+    "fa_candidates_count": 167,
+    "sample_duration_ms": 0.345,
+    "pass1_duration_ms": 1.848,
+    "pass2plus_duration_ms": 0.566,
+    "total_duration_ms": 7.494,
+    "index_build_duration_ms": 0.000,
+    "fa_hit_rate": -1.000000,
+    "topKBound_after_pass1": 30000.000000,
+    "partitions_pruned_pct": 0.984293,
+    "l_k_lower_bound": 432.026684,
+    "cs_above_lk": 10,
+    "partitions_exact_agg": 6,
+    "partitions_logical": 0,
+    "partitions_physical": 0
+  }
+}

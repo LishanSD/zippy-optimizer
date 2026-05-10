@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <string>
 
 // ── Sentinel value for empty FA slots — never a valid group_id ─────────────
 static constexpr uint64_t FA_EMPTY_KEY = UINT64_MAX;
@@ -12,6 +13,27 @@ struct Row {
     uint64_t group_id;  // 8 bytes
     double   value;     // 8 bytes
 };
+
+// ── Monotonic aggregate functions targeted by the paper (§2) ───────────────
+enum class AggFunc { SUM, COUNT, MAX, MIN };
+
+inline AggFunc parse_agg_func(const std::string& s) {
+    if (s == "sum"   || s == "SUM")   return AggFunc::SUM;
+    if (s == "count" || s == "COUNT") return AggFunc::COUNT;
+    if (s == "max"   || s == "MAX")   return AggFunc::MAX;
+    if (s == "min"   || s == "MIN")   return AggFunc::MIN;
+    return AggFunc::SUM;
+}
+
+inline const char* agg_func_name(AggFunc f) {
+    switch (f) {
+        case AggFunc::SUM:   return "sum";
+        case AggFunc::COUNT: return "count";
+        case AggFunc::MAX:   return "max";
+        case AggFunc::MIN:   return "min";
+    }
+    return "sum";
+}
 
 // ============================================================================
 // Hash Functions
@@ -88,10 +110,25 @@ inline uint32_t portable_ctzll(uint64_t x) {
 #include <cmath>
 
 struct FAEntry {
-    uint64_t group_id = FA_EMPTY_KEY;  // FA_EMPTY_KEY means slot is vacant
-    double   exact_sum = 0.0;          // running exact aggregate (SUM queries)
-    // 16 bytes total — 4 entries fit per 64-byte cache line
+    uint64_t group_id   = FA_EMPTY_KEY;                          // FA_EMPTY_KEY means slot vacant
+    double   exact_sum  = 0.0;                                   // SUM aggregate
+    uint64_t exact_count = 0;                                    // COUNT aggregate
+    double   exact_max  = std::numeric_limits<double>::lowest(); // MAX aggregate
+    double   exact_min  = std::numeric_limits<double>::max();    // MIN aggregate
+    // 32 bytes — 2 entries per 64-byte cache line. Patent description col. 13:
+    // "monotonic aggregation functions, such as ... COUNT(Y), MAX(Y), MIN(Y),
+    // SUM(Y) where Y >= 0".
 };
+
+inline double fa_entry_value(const FAEntry& e, AggFunc f) {
+    switch (f) {
+        case AggFunc::SUM:   return e.exact_sum;
+        case AggFunc::COUNT: return static_cast<double>(e.exact_count);
+        case AggFunc::MAX:   return e.exact_max;
+        case AggFunc::MIN:   return e.exact_min;
+    }
+    return e.exact_sum;
+}
 
 class FATable {
     std::vector<FAEntry> table_;   // size = 2 * capacity_
@@ -123,7 +160,7 @@ public:
     }
 
     // Insert a group_id as an FA candidate (called during setup, before Pass 1).
-    // Initialises exact_sum to 0. Idempotent: re-inserting an existing key is a no-op.
+    // Idempotent: re-inserting an existing key is a no-op.
     void insert(uint64_t group_id) {
         assert(group_id != FA_EMPTY_KEY && "Cannot insert sentinel key");
         size_t idx = probe(group_id);
@@ -134,22 +171,29 @@ public:
             }
             if (table_[pos].group_id == FA_EMPTY_KEY) {
                 assert(occupied_ < capacity_ && "FA table is full");
-                table_[pos].group_id = group_id;
-                table_[pos].exact_sum = 0.0;
+                table_[pos].group_id    = group_id;
+                table_[pos].exact_sum   = 0.0;
+                table_[pos].exact_count = 0;
+                table_[pos].exact_max   = std::numeric_limits<double>::lowest();
+                table_[pos].exact_min   = std::numeric_limits<double>::max();
                 ++occupied_;
                 return;
             }
         }
     }
 
-    // Update aggregate for a known FA group (called in Pass 1 hot loop).
-    // Precondition: group_id was previously inserted via insert().
+    // Update aggregate for a known FA group (Pass 1 hot loop). Updates all
+    // four monotonic aggregates so a single FATable serves any AggFunc.
     void update(uint64_t group_id, double val) {
         size_t idx = probe(group_id);
         for (size_t i = 0; i < table_.size(); ++i) {
             size_t pos = (idx + i) % table_.size();
             if (table_[pos].group_id == group_id) {
-                table_[pos].exact_sum += val;
+                FAEntry& e = table_[pos];
+                e.exact_sum   += val;
+                e.exact_count += 1;
+                if (val > e.exact_max) e.exact_max = val;
+                if (val < e.exact_min) e.exact_min = val;
                 return;
             }
             if (table_[pos].group_id == FA_EMPTY_KEY) {
@@ -158,30 +202,37 @@ public:
         }
     }
 
+    // Legacy SUM accessor (kept for existing tests / brute-force).
     double get(uint64_t group_id) const {
+        return get(group_id, AggFunc::SUM);
+    }
+
+    double get(uint64_t group_id, AggFunc f) const {
         size_t idx = probe(group_id);
         for (size_t i = 0; i < table_.size(); ++i) {
             size_t pos = (idx + i) % table_.size();
-            if (table_[pos].group_id == group_id) return table_[pos].exact_sum;
+            if (table_[pos].group_id == group_id) return fa_entry_value(table_[pos], f);
             if (table_[pos].group_id == FA_EMPTY_KEY) return 0.0;
         }
         return 0.0;
     }
 
-    // Return the top-k groups by exact_sum, sorted descending.
-    std::vector<std::pair<uint64_t,double>> top_k(size_t k) const {
-        // Collect all occupied entries
+    // Return the top-k groups by `f`, sorted descending.
+    std::vector<std::pair<uint64_t,double>> top_k(size_t k, AggFunc f = AggFunc::SUM) const {
         std::vector<std::pair<uint64_t,double>> entries;
         entries.reserve(occupied_);
         for (const auto& e : table_) {
             if (e.group_id != FA_EMPTY_KEY) {
-                entries.emplace_back(e.group_id, e.exact_sum);
+                entries.emplace_back(e.group_id, fa_entry_value(e, f));
             }
         }
         size_t n = std::min(k, entries.size());
         if (n > 0) {
             std::partial_sort(entries.begin(), entries.begin() + n, entries.end(),
-                [](const auto& a, const auto& b) { return a.second > b.second; });
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second > b.second;
+                    return a.first < b.first;
+                });
         }
         entries.resize(n);
         return entries;
@@ -196,6 +247,20 @@ public:
                 ids.push_back(e.group_id);
         }
         return ids;
+    }
+
+    // Lowest exact_count among current FA groups — patent uses this as T_c
+    // (Section 4.3 / claim 4) when deciding logical vs physical partitioning.
+    uint64_t lowest_count() const {
+        uint64_t lo = UINT64_MAX;
+        bool any = false;
+        for (const auto& e : table_) {
+            if (e.group_id != FA_EMPTY_KEY) {
+                any = true;
+                if (e.exact_count < lo) lo = e.exact_count;
+            }
+        }
+        return any ? lo : 0;
     }
 
     size_t size()     const { return occupied_; }
@@ -254,19 +319,42 @@ struct FMSketch {
 // ============================================================================
 
 struct CAPartition {
-    double   total_sum = 0.0;                                   // UB for SUM pruning
-    double   max_value = std::numeric_limits<double>::lowest();  // UB for MAX pruning
-    double   min_value = std::numeric_limits<double>::max();     // UB for MIN pruning
-    uint64_t count     = 0;                                     // row count
-    FMSketch fm;                                                 // approx distinct groups
+    double   total_sum = 0.0;                                   // UB for SUM/AVG (patent col. 13)
+    double   max_value = std::numeric_limits<double>::lowest();  // UB for MAX/MIN
+    double   min_value = std::numeric_limits<double>::max();     // tracked for completeness
+    uint64_t count     = 0;                                     // UB for COUNT
+    FMSketch fm;                                                 // approx distinct groups (FA gating)
     bool     pruned    = false;                                  // pruned flag
 
-    // Estimated per-group aggregate (Algorithm 4 partition ranking).
-    // Patent formula: total_sum / approx_distinct_count.
-    double estimated_per_group_sum() const {
-        uint32_t d = fm.estimate();
-        return d == 0 ? total_sum : total_sum / static_cast<double>(d);
+    // Per-aggregate upper bound used by MergeAndPrune (Algorithm 4 line 12).
+    // Patent description col. 13: SUM/AVG bounded by partition.total_sum;
+    // MAX/MIN bounded by partition.max_value; COUNT bounded by partition.count.
+    double upper_bound(AggFunc f) const {
+        switch (f) {
+            case AggFunc::SUM:   return total_sum;
+            case AggFunc::COUNT: return static_cast<double>(count);
+            case AggFunc::MAX:   return max_value;
+            case AggFunc::MIN:   return max_value;  // group's MIN ≤ any row in partition ≤ partition MAX
+        }
+        return total_sum;
     }
+
+    // Estimated per-group aggregate for ranking (patent description col. 8:
+    // psum/d for SUM, psum/count for AVG, pmax for MAX, pmin for MIN).
+    double estimated_per_group(AggFunc f) const {
+        const uint32_t d = fm.estimate();
+        switch (f) {
+            case AggFunc::SUM:   return d == 0 ? total_sum : total_sum / static_cast<double>(d);
+            case AggFunc::COUNT: return d == 0 ? static_cast<double>(count)
+                                               : static_cast<double>(count) / static_cast<double>(d);
+            case AggFunc::MAX:   return max_value;
+            case AggFunc::MIN:   return max_value;
+        }
+        return total_sum;
+    }
+
+    // Legacy alias.
+    double estimated_per_group_sum() const { return estimated_per_group(AggFunc::SUM); }
 };
 
 class CATable {
@@ -278,7 +366,6 @@ public:
         : n_partitions_(n_partitions)
     {
         partitions_.resize(n_partitions_);
-        // CAPartition default-constructs with safe zero/sentinel values
     }
 
     size_t n_partitions() const { return n_partitions_; }
@@ -288,7 +375,6 @@ public:
     }
 
     // Hot path: called for every non-FA row in Pass 1.
-    // Updates all five fields of the target partition.
     void update(uint64_t group_id, double val) {
         size_t p = partition_of(group_id);
         CAPartition& part = partitions_[p];
@@ -299,11 +385,10 @@ public:
         part.fm.update(group_id);
     }
 
-    // Prune all partitions whose total_sum < topKBound.
-    // Safe for SUM: total_sum is an upper bound on any group's aggregate.
-    void prune(double topKBound) {
+    // Prune partitions whose UB for the given aggregate < topKBound.
+    void prune(double topKBound, AggFunc f = AggFunc::SUM) {
         for (auto& part : partitions_) {
-            if (!part.pruned && part.total_sum < topKBound) {
+            if (!part.pruned && part.upper_bound(f) < topKBound) {
                 part.pruned = true;
             }
         }
@@ -319,14 +404,13 @@ public:
         return survivors;
     }
 
-    // Return surviving partitions sorted by estimated_per_group_sum() descending.
     // Algorithm 4 partition ranking: process highest-potential partitions first.
-    std::vector<size_t> ranked_surviving_partitions() const {
+    std::vector<size_t> ranked_surviving_partitions(AggFunc f = AggFunc::SUM) const {
         auto survivors = surviving_partitions();
         std::sort(survivors.begin(), survivors.end(),
-            [this](size_t a, size_t b) {
-                return partitions_[a].estimated_per_group_sum()
-                     > partitions_[b].estimated_per_group_sum();
+            [this, f](size_t a, size_t b) {
+                return partitions_[a].estimated_per_group(f)
+                     > partitions_[b].estimated_per_group(f);
             });
         return survivors;
     }
