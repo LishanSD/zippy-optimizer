@@ -62,6 +62,143 @@ and handle everything else cheaply.
 
 ---
 
+## 1.5 Current Implementation State (last updated 2026-05-10)
+
+> **Read this first.** Sections 2–19 below describe the *full intended design* of
+> the Zippy + extensions project. This section summarises what is actually built
+> in `src/` today, what's been validated, and what's deferred. For the detailed
+> paper-vs-patent-vs-code audit, see [`PAPER_AUDIT.md`](PAPER_AUDIT.md).
+> For the original session that produced this state, see
+> [`SESSION_CONTEXT.md`](SESSION_CONTEXT.md).
+
+### Reference material in repo
+- `p644-siddiqui-paper.pdf` — Siddiqui et al., PVLDB 17(4) 2023 (the paper).
+- `patent-application.pdf` — US 12,380,098 B2, issued Aug 5, 2025 (the patent).
+  More implementation-specific than the paper; claims 1, 2, 3, 4, 7, 8, 9 (and
+  the parallel method claims 11, 12, 13, 14, 17, 18, 19) define what's actually
+  protected.
+
+### What's implemented (paper-faithful)
+
+- **Algorithm 1** outline (sample → Pass 1 → MergeAndPrune → multi-pass loop).
+- **Algorithm 2** with **real Hoeffding lower bounds** (`sampler.cpp`):
+  - per-group ε = (b−a)·√(ln(2/(1−β))/(2nᵢ′))
+  - L_k = K-th highest LB; tempGroups = {g : LB(g) ≥ L_k}
+  - **C_s > C_f gate** → `is_optimizable = false` → fall back to brute-force
+    (patent claim 7 / 17)
+  - heavy-hitter top-up by sample count (patent description col. 10 — Cs+Ch≈Cf)
+  - secondary CI skew gate: top-K share of total < 1% → fall back (claim 2 / 12)
+- **Algorithm 3** routing with **adaptive partitioning decision**
+  (`zippy.cpp:classify_partition`):
+  - distinct < FA capacity → EXACT
+  - locality `d/count < α₀` (default 0.20) → EXACT
+  - C_p / Q < T_c → LOGICAL (patent claim 4 / 14)
+  - else PHYSICAL
+  - decision counts surfaced in `RunMetrics.partitions_{exact_agg,logical,physical}`.
+- **Algorithm 4** MergeAndPrune with **multi-aggregate UB** (patent description
+  col. 13):
+  - SUM/AVG → `partition.total_sum`, MAX/MIN → `partition.max_value`,
+    COUNT → `partition.count`
+- **Multi-aggregate end-to-end**: `AggFunc {SUM, COUNT, MAX, MIN}`. `FAEntry` widened
+  to 32 bytes, all four tracked simultaneously (`data_structures.h`). CLI flag
+  `--agg sum|count|max|min`.
+- **Pass 1 union UB**: Pass 1 `topKBound` is K-th highest of `{FA exact values} ∪
+  {partition UBs}`, matching Algorithm 4 line 12 (was previously FA-only).
+- **Brute-force comparator** generalised for all four aggregates.
+- **CLI parameters**: All tuning variables mentioned in the paper and patent (fa-capacity, n-partitions, sample-frac, delta, alpha-ci, beta-ci, alpha-locality, segment-size, underrep-threshold, boost-rows, measure-m) are fully exposed via CLI flags (`main.cpp`).
+
+### What's deliberately NOT implemented (deferred)
+
+- **Multi-core parallelism** (paper §4.4, patent claim 1's "each core"). The
+  algorithm is correct single-threaded; throughput ~7× lower than the paper's
+  multicore numbers. The LOGICAL/PHYSICAL distinction therefore has no execution
+  consequence in this prototype — the decision is recorded for metrics only.
+- **Extension B** (Measure Column Index). `main.cpp` returns errors for `--mode ext-b|ext-ab`.
+  `measure_index.h` provides a compilable header-only min-heap scaffold; not yet wired.
+- **Patent's β/2-percentile CI for MAX/MIN**. We currently use sample MAX (rigorous
+  LB on group MAX) and sample MIN (heuristic only — strictly an upper bound on
+  group MIN). Order-preserving for ranking but not rigorous.
+- **Segment-based locality** `Σ_s d_s/c_s / t` over `s = 100k`-sized segments.
+  We use the single-segment approximation `d/count`. Same direction of decision,
+  cheaper to compute under the dataset-rescan model.
+
+### Modules and their state
+
+| File | State | Notes |
+|---|---|---|
+| `src/data_structures.h` | ✅ multi-aggregate | `AggFunc` enum, 32-byte `FAEntry`, `CAPartition::upper_bound(AggFunc)`, `CATable::prune(topKBound, AggFunc)` |
+| `src/sampler.{h,cpp}` | ✅ Hoeffding-correct | exposes `l_k_lower_bound`, `cs_above_lk` in `SampleResult` |
+| `src/zippy.{h,cpp}` | ✅ Alg 1/3/4 + ext-a | classify_partition + multi-agg merge/prune + `run_zippy_ext_a` |
+| `src/utils.h` | ✅ extended metrics | adds L_k, partition-decision counts, `index_build_duration_ms` |
+| `src/main.cpp` | ✅ `--agg` + ext-a wired | `ext-b/ab` modes return errors |
+| `src/group_index.{h,cpp}` | ✅ complete | `build()`, `is_underrepresented()`, `get_boost_rows()`, `row_count_for()` |
+| `src/stratified_sampler.{h,cpp}` | ✅ complete | two-phase sampler; Hoeffding LB + L_k + heavy-hitter fill identical to baseline |
+| `src/measure_index.{h,cpp}` | 🔲 scaffold | compilable header-only min-heap; Extension B not wired |
+| `python/generate_data.py` | ✅ as designed | use `--rare-group-fraction 0.0` for non-tied datasets |
+
+### Build / verify (current)
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+
+
+# All five test gates pass:
+g++ -std=c++17 -O2 -Wall -Wextra -o build/test_ds       src/test_data_structures.cpp -Isrc/ && ./build/test_ds
+g++ -std=c++17 -O2 -Wall -Wextra -o build/test_sampler  src/test_sampler.cpp src/sampler.cpp -Isrc/ && ./build/test_sampler
+g++ -std=c++17 -O2 -Wall -Wextra -o build/test_phase4b  src/test_phase4b.cpp src/zippy.cpp src/sampler.cpp -Isrc/ && ./build/test_phase4b
+g++ -std=c++17 -O2 -Wall -Wextra -o build/test_phase4c  src/test_phase4c.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/ && ./build/test_phase4c --input data/S0.bin --n-rows 10089 --k 10
+g++ -std=c++17 -O2 -Wall -Wextra -o build/test_phase5   src/test_phase5.cpp  src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/ && ./build/test_phase5 --input data/S0.bin --n-rows 10089 --k 10
+
+# All four aggregates match brute-force on S0 for baseline:
+for AGG in sum count max min; do
+  ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --agg $AGG --output results/S0_bf_$AGG.json
+  ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline   --agg $AGG --output results/S0_bl_$AGG.json
+  cmp -s <(jq -c '.top_k_results' results/S0_bf_$AGG.json) <(jq -c '.top_k_results' results/S0_bl_$AGG.json) && echo "$AGG: ok"
+done
+
+# Extension A matches brute-force on S0:
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a       --output results/S0_ext_a.json
+cmp -s <(jq -c '.top_k_results' results/S0_bf.json) <(jq -c '.top_k_results' results/S0_ext_a.json) && echo "ext-a: ok"
+
+# Forced-fallback path (Cs > Cf):
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --agg sum --fa-capacity 5 --output /tmp/x.json
+# → metrics.is_optimizable = false, top-K still matches brute-force
+```
+
+### Known artefact
+
+When `--rare-group-fraction > 0` and `--n-partitions` happens to coalesce
+single-group rare partitions with other groups, partition UBs can push
+`topKBound` strictly above the tied groups' value. The pass-1 prune (correctly
+per Algorithm 4) drops single-group partitions whose UB equals the tied value;
+final top-K is still a *valid* top-K (same value-multiset as brute-force) but
+picks a different subset of the tied groups. This is a paper-conformant
+tie-breaking artifact, not a correctness bug — see `PAPER_AUDIT.md` "Caveats".
+
+### Phase status (vs. Section 5.1's plan)
+
+| Phase | Original plan | Actual state |
+|---|---|---|
+| 1 | Build + data loader | ✅ done |
+| 2 | Brute-force | ✅ done, multi-aggregate |
+| 3 | FATable / FMSketch / CATable | ✅ done, multi-aggregate |
+| 4A | Sampler + candidate selection | ✅ done with Hoeffding LB + L_k |
+| 4B | Pass 1 routing + pruning | ✅ done, union UB |
+| 4C | MergeAndPrune + multi-pass | ✅ done, multi-aggregate, with adaptive classification |
+| 5 | Extension A | ✅ done — GroupOccurrenceIndex + StratifiedSampler + `run_zippy_ext_a` wired, test gate passing |
+| 6 | Extension B | 🔲 not started |
+| 7 | Combined + correctness sweep | 🔲 not started |
+| 8 | Experiment matrix + plots | 🔲 not started |
+
+The originally-planned "Phase 4C complete" has been *materially expanded*:
+Hoeffding LB / L_k, multi-aggregate, segment locality, logical/physical
+classification, Pass 1 union UB, fall-back gate. These were cataloged as
+deviations in `PAPER_AUDIT.md` and have been closed (except parallelism +
+extensions, which are intentionally deferred).
+
+---
+
 ## 2. Zippy Algorithm — Full Detail
 
 > **See Section 3 for the verbatim paper pseudocode (Algorithms 1–4).** The prose

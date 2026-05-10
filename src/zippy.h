@@ -1,8 +1,9 @@
 #pragma once
 // zippy.h — Public interface of the Zippy top-k engine.
 //
-// Phase 4C: brute-force + baseline (sampling + pass1 pruning + multi-pass) are implemented.
-// Subsequent phases will add ext-a, ext-b, ext-ab.
+// Phase 4C: brute-force + baseline (sampling + pass1 pruning + multi-pass) implemented.
+// Phase 5:  Extension A (stratified sampling via GroupOccurrenceIndex) implemented.
+// Subsequent phases will add ext-b, ext-ab.
 
 #include "data_structures.h"
 #include "utils.h"
@@ -46,8 +47,17 @@ RunMetrics run_zippy_baseline(
     std::vector<std::pair<uint64_t,double>>& out_results,
     std::vector<uint64_t>& out_fa_groups);
 
+// Extension A (Phase 5): stratified sampling via GroupOccurrenceIndex.
+// Builds the index in one pre-pass, then uses two-phase sampling before
+// running the same baseline Zippy pipeline (Pass 1 → MergeAndPrune → loop).
+RunMetrics run_zippy_ext_a(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
 // ── Future phases will add these declarations ──────────────────────────────
-// Phase 5: RunMetrics run_zippy_ext_a(...)
 
 RunMetrics run_zippy_ext_b(
     const std::vector<Row>& dataset,
