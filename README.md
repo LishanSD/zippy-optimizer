@@ -176,40 +176,99 @@ pip install numpy matplotlib pandas
 
 ---
 
-## 7. Full baseline Zippy validation workflow (S0 + S1)
+## 7. Impact Demonstration Workflow
 
-Use this when you want to confirm the full Phase 4C baseline behavior end-to-end.
+This section uses three datasets of increasing difficulty to show the concrete impact of Zippy over brute-force, and of Extension A over baseline Zippy.
+
+### Dataset Overview
+
+| Dataset | Rows | Groups | Zipf α | Rare groups | Purpose |
+|---------|------|--------|--------|-------------|---------|
+| **S0** | ~10K | 500 | 1.2 | 10% (few rows, 100× value) | Quick correctness check |
+| **S1** | 10M | 1M | 1.2 | None | Shows Zippy speed vs brute-force |
+| **S2** | ~11M | 10M | 1.0 | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes |
+
+### Step 1 — Build
 
 ```bash
-# 1) Build zippy
 g++ -std=c++17 -O2 -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
-
-# 2) Ensure S0 and S1 exist (S1 may take some time to generate)
-python python/generate_data.py --output data/S0.bin --n-rows 10000 --n-groups 500 --zipf-alpha 1.2 --rare-group-fraction 0.1 --rare-group-rows 3 --rare-group-value-multiplier 100
-python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups 1000000 --zipf-alpha 1.2 --rare-group-fraction 0.0
-
-# 3) Run brute-force and baseline on S0
-./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
-./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --output results/S0_baseline.json
-
-# 4) Run ext-a on S0 and compare with brute-force
-./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a --output results/S0_ext_a.json --verbose
-
-# 5) Run brute-force and baseline on S1
-./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode brute-force --output results/S1_bf.json
-./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
-./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-a   --output results/S1_ext_a.json  --verbose
-
-# 6) Compare top-k ID sets + print baseline metrics
-python python/compare_phase4c_results.py
 ```
 
-Expected outcome for Phase 4C baseline:
+### Step 2 — Generate datasets
 
-- S0 and S1 top-k ID sets match brute-force exactly.
-- S1 should typically converge in ~1–2 passes with high pruning on skewed data.
+```bash
+# S0: small correctness dataset (fast to run during development)
+python python/generate_data.py --output data/S0.bin --n-rows 10000 --n-groups 500 --zipf-alpha 1.2 --rare-group-fraction 0.1 --rare-group-rows 3 --rare-group-value-multiplier 100
+
+# S1: 10M-row skewed dataset — demonstrates Zippy efficiency vs brute-force
+# 10M groups exceeds CPU cache, causing brute-force to thrash and slow down.
+python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups 10000000 --zipf-alpha 1.1 --rare-group-fraction 0.0
+
+# S2: adversarial high-cardinality dataset — demonstrates Extension A's pass reduction.
+# Rare groups need enough rows to be eligible for the current underrepresentation
+# boost. Single-row rare groups have expected sample count < 0.5 and are skipped
+# by design, so they are not a good Ext-A demo for this prototype.
+python python/generate_data.py --output data/S2.bin --n-rows 10000000 --n-groups 10000000 --zipf-alpha 1.0 --rare-group-fraction 0.00001 --rare-group-rows 20000 --rare-group-value-multiplier 10000 --seed 42
+```
+
+### Step 3 — Correctness check on S0
+
+```bash
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline    --output results/S0_baseline.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a       --output results/S0_ext_a.json
+```
+
+All three should produce the same top-10 group IDs.
+
+### Step 4 — Zippy efficiency on S1 (no rare groups)
+
+```bash
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode brute-force --output results/S1_bf.json
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-a --output results/S1_ext_a.json --verbose
+```
+
+**What to look for in the metrics JSON:**
+
+| Metric | Brute-force | Baseline (expected) |
+|--------|-------------|---------------------|
+| `total_duration_ms` | ~1500 ms (Cache miss penalty) | **~400 ms** (3–4× faster) |
+| `partitions_pruned_pct` | — | **> 90%** |
+| `total_passes` | — | **1–2** |
+
+On S1 (no rare groups), baseline and ext-a should produce nearly identical results — the index build overhead is the only difference.
+
+### Step 5 — Extension A impact on S2 (adversarial rare groups)
+
+```bash
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode brute-force --output results/S2_bf.json
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode baseline --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --output results/S2_baseline.json --verbose
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-a --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000 --output results/S2_ext_a.json --verbose
+```
+
+> **S2 row count:** With `--seed 42`, the generator produced exactly **11,027,264 rows**. If you regenerate with a different seed, use the `"n_rows"` value printed by `generate_data.py`.
+
+**What to look for:**
+
+| Metric | Brute-force | Baseline (expected) | ext-a (expected) |
+|--------|-------------|---------------------|------------------|
+| `total_duration_ms` | ~1300 ms | ~1050 ms | ~1800 ms including index build |
+| `topKBound_after_pass1` | — | ~7.7B | ~9.9B |
+| `partitions_pruned_pct` | — | ~90% | ~100% |
+| `total_passes` | — | 3 passes | 1 pass |
+| `pass2plus_duration_ms` | — | ~700 ms | ~0 ms |
+| `index_build_duration_ms` | 0.0 ms | 0.0 ms | ~1300 ms one-shot overhead |
+
+**Why can Ext-A still be slower in total duration?**
+`total_duration_ms` includes building the `GroupOccurrenceIndex` from scratch. On this prototype, the index is not persisted or reused, so Ext-A must first scan and materialize group positions before it can save later Zippy passes. The impact is visible in `topKBound_after_pass1`, `partitions_pruned_pct`, `total_passes`, and `pass2plus_duration_ms`; the wall-clock win appears only when the index is amortized across repeated queries or prebuilt outside the timed query path.
 
 ---
+
 
 ## 8. Run Each Phase
 
@@ -234,29 +293,16 @@ cd ..
 
 ```bash
 # Tiny dataset (1K rows, 50 groups, with rare high-value groups)
-python python/generate_data.py \
-    --output data/tiny.bin \
-    --n-rows 1000 --n-groups 50 --zipf-alpha 1.2 \
-    --rare-group-fraction 0.1 --rare-group-rows 3 \
-    --rare-group-value-multiplier 100
+python python/generate_data.py --output data/tiny.bin --n-rows 1000 --n-groups 50 --zipf-alpha 1.2 --rare-group-fraction 0.1 --rare-group-rows 3 --rare-group-value-multiplier 100
 
 # Larger test dataset (10K rows)
-python python/generate_data.py \
-    --output data/S0.bin \
-    --n-rows 10000 --n-groups 500 --zipf-alpha 1.2 \
-    --rare-group-fraction 0.1 --rare-group-rows 3 \
-    --rare-group-value-multiplier 100
+python python/generate_data.py --output data/S0.bin --n-rows 10000 --n-groups 500 --zipf-alpha 1.2 --rare-group-fraction 0.1 --rare-group-rows 3 --rare-group-value-multiplier 100
 ```
 
 ### iii. Run brute-force top-k
 
 ```bash
-./build/zippy \
-    --input data/tiny.bin \
-    --n-rows 1012 \
-    --k 5 \
-    --mode brute-force \
-    --output results/tiny_bf.json
+./build/zippy --input data/tiny.bin --n-rows 1012 --k 5 --mode brute-force --output results/tiny_bf.json
 ```
 
 ### iv. Verify correctness against Python

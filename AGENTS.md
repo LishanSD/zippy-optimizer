@@ -139,10 +139,8 @@ and handle everything else cheaply.
 ### Build / verify (current)
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -o build/zippy \
-    src/main.cpp src/zippy.cpp src/sampler.cpp \
-    src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp \
-    -Isrc/
+g++ -std=c++17 -O2 -Wall -Wextra -o build/zippy src/main.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+
 
 # All five test gates pass:
 g++ -std=c++17 -O2 -Wall -Wextra -o build/test_ds       src/test_data_structures.cpp -Isrc/ && ./build/test_ds
