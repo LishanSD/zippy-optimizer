@@ -7,15 +7,18 @@
 #include "group_index.h"
 
 #include <algorithm>
-#include <cmath>
 
 void GroupOccurrenceIndex::build(const std::vector<Row>& dataset) {
     index_.clear();
     total_rows_ = dataset.size();
 
-    // Pre-reserve a reasonable bucket count to reduce rehashing.
-    // Use sqrt(N) as a rough estimate of distinct groups (conservative).
-    index_.reserve(static_cast<size_t>(std::sqrt(static_cast<double>(total_rows_))) + 1);
+    // Extension A is most useful on high-cardinality inputs, so under-reserving
+    // here turns the index build into repeated full-table rehashes. We do not
+    // know the exact distinct count without another pass; N/4 is a pragmatic
+    // estimate for the high-cardinality benchmark shape and avoids the memory
+    // cost of reserving one bucket per row.
+    const size_t estimated_groups = std::max<size_t>(1, total_rows_ / 4);
+    index_.reserve(estimated_groups);
 
     for (size_t i = 0; i < dataset.size(); ++i) {
         index_[dataset[i].group_id].push_back(static_cast<uint64_t>(i));
