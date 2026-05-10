@@ -58,5 +58,12 @@ RunMetrics run_zippy_ext_a(
     std::vector<uint64_t>& out_fa_groups);
 
 // ── Future phases will add these declarations ──────────────────────────────
-// Phase 6: RunMetrics run_zippy_ext_b(...)
+
+RunMetrics run_zippy_ext_b(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);
+
 // Phase 7: RunMetrics run_zippy_ext_ab(...)

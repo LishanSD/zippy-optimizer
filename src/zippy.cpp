@@ -7,6 +7,7 @@
 
 #include "zippy.h"
 #include "sampler.h"
+#include "measure_index.h" // Add this at the top of zippy.cpp
 #include "group_index.h"
 #include "stratified_sampler.h"
 
@@ -630,6 +631,223 @@ RunMetrics run_zippy_ext_a(
     }
 
     out_results = top_k_from_exact(exact_aggregates_ea, k_size, cfg.agg_func);
+    metrics.total_duration_ms = total_timer.elapsed_ms();
+
+    return metrics;
+}
+
+RunMetrics run_zippy_ext_b(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups)
+{
+    RunMetrics metrics;
+    out_results.clear();
+    out_fa_groups.clear();
+    metrics.total_passes = 0;
+
+    Timer total_timer;
+    total_timer.reset();
+    const size_t k_size = (k > 0) ? static_cast<size_t>(k) : 0;
+
+    if (dataset.empty() || k_size == 0) {
+        metrics.total_duration_ms = total_timer.elapsed_ms();
+        return metrics;
+    }
+
+    // ── Extension B: Build Measure Index (Pre-Pass) ───────────
+    Timer index_timer;
+    index_timer.reset();
+    std::unordered_set<uint64_t> extreme_groups = build_measure_index(dataset, cfg.measure_m);
+    metrics.index_build_duration_ms = index_timer.elapsed_ms();
+
+    // ── Algorithm 2: Sampling + Injection ─────────────────────
+    Timer sample_timer;
+    sample_timer.reset();
+    const SampleResult sample = uniform_sample_and_select(
+        dataset,
+        cfg.fa_capacity,
+        k,
+        cfg.agg_func,
+        cfg.sample_frac,
+        cfg.delta,
+        cfg.alpha_ci,
+        cfg.beta_ci,
+        42,
+        extreme_groups); // <-- Pass the extreme groups here!
+    
+    metrics.sample_duration_ms = sample_timer.elapsed_ms();
+    
+    metrics.sample_size_actual = sample.sample_size_actual;
+    metrics.fa_candidates_count = sample.fa_groups.size();
+    metrics.is_optimizable = sample.is_optimizable;
+    metrics.l_k_lower_bound = sample.l_k_lower_bound;
+    metrics.cs_above_lk = sample.cs_above_lk;
+
+    if (!sample.is_optimizable) {
+        // Algorithm 1 line 14: fall back to baseline aggregation.
+        out_results = run_brute_force(dataset, k, cfg.agg_func);
+        metrics.total_duration_ms = total_timer.elapsed_ms();
+        return metrics;
+    }
+
+    // ── Pass 1: FA / CA routing ──────────────────────────────────────────
+    FATable fa(cfg.fa_capacity);
+    for (uint64_t gid : sample.fa_groups) fa.insert(gid);
+
+    out_fa_groups = fa.all_group_ids();
+    std::sort(out_fa_groups.begin(), out_fa_groups.end());
+
+    CATable ca(cfg.n_partitions);
+
+    Timer pass1_timer;
+    pass1_timer.reset();
+    for (const auto& row : dataset) {
+        assert(row.group_id != FA_EMPTY_KEY && "group_id must not equal FA sentinel key");
+        if (fa.contains(row.group_id)) {
+            fa.update(row.group_id, row.value);
+        } else {
+            ca.update(row.group_id, row.value);
+        }
+    }
+
+    // Pass 1 top-K bound: K-th highest among {FA exact values} ∪ {partition UBs}
+    // (Algorithm 4 line 12 — paper / patent require the union, not FA-only).
+    std::vector<double> pass1_union;
+    pass1_union.reserve(fa.size() + cfg.n_partitions);
+    {
+        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        for (const auto& [gid, val] : fa_all) {
+            (void)gid;
+            pass1_union.push_back(val);
+        }
+        for (size_t pid = 0; pid < cfg.n_partitions; ++pid) {
+            const CAPartition& part = ca.partition(pid);
+            if (part.count > 0) pass1_union.push_back(part.upper_bound(cfg.agg_func));
+        }
+    }
+    const double topKBound = kth_highest_or_zero(pass1_union, k_size);
+
+    ca.prune(topKBound, cfg.agg_func);
+
+    metrics.pass1_duration_ms = pass1_timer.elapsed_ms();
+    metrics.topKBound_after_pass1 = topKBound;
+    metrics.partitions_pruned_pct = ca.pruning_fraction();
+    metrics.total_passes = 1;
+
+    ExactAggregates exact_aggregates;
+    exact_aggregates.reserve(std::max<size_t>(fa.size() * 2, 1));
+    for (uint64_t gid : out_fa_groups) {
+        ExactAccum acc;
+        acc.sum   = fa.get(gid, AggFunc::SUM);
+        acc.count = static_cast<uint64_t>(fa.get(gid, AggFunc::COUNT));
+        acc.max_v = fa.get(gid, AggFunc::MAX);
+        acc.min_v = fa.get(gid, AggFunc::MIN);
+        exact_aggregates[gid] = acc;
+    }
+
+    std::vector<std::unordered_set<size_t>> active_history(2);  // index 0 unused
+    ChildPartitions active_partitions;
+    for (size_t pid : ca.surviving_partitions()) {
+        active_history[1].insert(pid);
+        active_partitions.emplace(pid, ca.partition(pid));
+    }
+
+    if (cfg.verbose) {
+        std::fprintf(stderr,
+                     "[ext-b-pass1] agg=%s topKBound=%.6f pruned=%.2f%% "
+                     "survivors=%zu L_k=%.6f Cs=%zu\n",
+                     agg_func_name(cfg.agg_func),
+                     metrics.topKBound_after_pass1,
+                     metrics.partitions_pruned_pct * 100.0,
+                     active_partitions.size(),
+                     metrics.l_k_lower_bound,
+                     metrics.cs_above_lk);
+    }
+
+    // ── Pass 2+: MergeAndPrune + adaptive partitioning ───────────────────
+    int level = 2;
+    bool done = active_partitions.empty();
+
+    while (!done && !active_partitions.empty()) {
+        // Algorithm 3 lines 5–24 / patent claims 3, 4, 13, 14: classify each
+        // parent partition for this pass.
+        const uint64_t t_c = fa.lowest_count();
+        std::unordered_map<size_t, PartitionDecision> decisions;
+        decisions.reserve(active_partitions.size());
+        size_t pass_exact = 0, pass_logical = 0, pass_physical = 0;
+        for (const auto& [pid, part] : active_partitions) {
+            const PartitionDecision d = classify_partition(part, cfg, t_c);
+            decisions[pid] = d;
+            switch (d) {
+                case PartitionDecision::EXACT:    ++pass_exact;    break;
+                case PartitionDecision::LOGICAL:  ++pass_logical;  break;
+                case PartitionDecision::PHYSICAL: ++pass_physical; break;
+            }
+        }
+        metrics.partitions_exact_agg += pass_exact;
+        metrics.partitions_logical   += pass_logical;
+        metrics.partitions_physical  += pass_physical;
+
+        PartialAggregates partial;
+        ChildPartitions   children;
+        partial.reserve(4096);
+        children.reserve(active_partitions.size());
+
+        Timer pass_timer;
+        pass_timer.reset();
+        for (const auto& row : dataset) {
+            if (fa.contains(row.group_id)) continue;  // FA groups already exact
+            if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history))
+                continue;
+
+            const size_t parent_id = partition_id_for_level(row.group_id, cfg.n_partitions, level - 1);
+            const auto it = decisions.find(parent_id);
+            if (it == decisions.end()) continue;
+
+            if (it->second == PartitionDecision::EXACT) {
+                partial[row.group_id].update(row.value);
+            } else {
+                // LOGICAL or PHYSICAL: same execution path in this prototype
+                // (single-threaded — physical row movement provides no speedup).
+                const size_t child_id = partition_id_for_level(row.group_id, cfg.n_partitions, level);
+                update_partition_from_row(children[child_id], row.group_id, row.value);
+            }
+        }
+        metrics.pass2plus_duration_ms += pass_timer.elapsed_ms();
+        metrics.total_passes += 1;
+
+        const MergeAndPruneResult merged =
+            merge_and_prune(exact_aggregates, partial, children, k_size, cfg.agg_func);
+        done = merged.done;
+        if (cfg.verbose) {
+            std::fprintf(stderr,
+                         "[ext-b-pass%d] exact=%zu logical=%zu physical=%zu "
+                         "topKBound=%.6f survivors=%zu confirmed=%zu\n",
+                         metrics.total_passes,
+                         pass_exact, pass_logical, pass_physical,
+                         merged.top_k_bound,
+                         merged.surviving_partitions.size(),
+                         merged.top_k_confirmed);
+        }
+        if (done) break;
+
+        active_partitions = merged.surviving_partitions;
+        if (static_cast<int>(active_history.size()) <= level) {
+            active_history.resize(level + 1);
+        }
+        active_history[level].clear();
+        for (const auto& [pid, part] : active_partitions) {
+            (void)part;
+            active_history[level].insert(pid);
+        }
+
+        ++level;
+    }
+
+    out_results = top_k_from_exact(exact_aggregates, k_size, cfg.agg_func);
     metrics.total_duration_ms = total_timer.elapsed_ms();
 
     return metrics;

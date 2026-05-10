@@ -1,2 +1,3 @@
-data/
-results/
+data/*.bin
+results/*
+build/*

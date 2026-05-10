@@ -123,7 +123,9 @@ SampleResult uniform_sample_and_select(
     double delta,
     double alpha_ci,
     double beta_ci,
-    uint64_t seed)
+    uint64_t seed,
+    const std::unordered_set<uint64_t>& pre_injected_groups
+  )
 {
   SampleResult result;
   if (dataset.empty() || fa_capacity == 0 || k <= 0)
@@ -146,18 +148,19 @@ SampleResult uniform_sample_and_select(
   if (sample_size_target > n_rows)
     sample_size_target = n_rows;
 
-  const double p = static_cast<double>(sample_size_target) / static_cast<double>(n_rows);
-
   std::mt19937_64 rng(seed);
-  std::bernoulli_distribution select(p);
+  
+  // 1. DEFINE the uniform distribution to pick random array indices
+  std::uniform_int_distribution<size_t> dist(0, n_rows - 1);
 
   result.sample_stats.reserve(std::min(sample_size_target * 2, n_rows));
 
-  for (const auto &row : dataset)
-  {
-    if (!select(rng))
-      continue;
+  // 2. Loop EXACTLY sample_size_target times
+  for (size_t i = 0; i < sample_size_target; ++i) {
+    // 3. O(1) random access
+    const auto& row = dataset[dist(rng)];
 
+    // 4. NO COIN FLIP! Update stats directly.
     auto &stats = result.sample_stats[row.group_id];
     stats.sum += row.value;
     stats.count += 1.0;
@@ -165,6 +168,7 @@ SampleResult uniform_sample_and_select(
       stats.min_val = row.value;
     if (row.value > stats.max_val)
       stats.max_val = row.value;
+      
     ++result.sample_size_actual;
   }
 
@@ -258,8 +262,18 @@ SampleResult uniform_sample_and_select(
     }
   }
 
-  // FAgroups = tempGroups (Algorithm 2 line 33).
-  for (const auto& c : temp_groups) result.fa_groups.insert(c.group_id);
+  // --- Extension B Injection ---
+  // VIP access: Force-inject the extreme groups first.
+  for (uint64_t gid : pre_injected_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(gid);
+  }
+
+  // FAgroups = tempGroups (Algorithm 2 line 33), up to capacity.
+  for (const auto& c : temp_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(c.group_id);
+  }
 
   // Algorithm 2 lines 30–33 / patent col. 10: top up remaining FA slots with
   // heavy hitters (highest sample count) so C_s + C_h ≈ C_f.
