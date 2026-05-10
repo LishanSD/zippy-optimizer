@@ -43,7 +43,7 @@
     "sample_duration_ms": 0.000,
     "pass1_duration_ms": 0.000,
     "pass2plus_duration_ms": 0.000,
-    "total_duration_ms": 5729.761,
+    "total_duration_ms": 6025.408,
     "index_build_duration_ms": 0.000,
     "fa_hit_rate": -1.000000,
     "topKBound_after_pass1": 0.000000,
