@@ -48,4 +48,5 @@ SampleResult uniform_sample_and_select(
     double delta,
     double alpha_ci,
     double beta_ci,
-    uint64_t seed = 42);
+    uint64_t seed = 42,
+const std::unordered_set<uint64_t>& pre_injected_groups = {});

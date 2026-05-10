@@ -123,7 +123,9 @@ SampleResult uniform_sample_and_select(
     double delta,
     double alpha_ci,
     double beta_ci,
-    uint64_t seed)
+    uint64_t seed,
+    const std::unordered_set<uint64_t>& pre_injected_groups
+  )
 {
   SampleResult result;
   if (dataset.empty() || fa_capacity == 0 || k <= 0)
@@ -260,8 +262,18 @@ SampleResult uniform_sample_and_select(
     }
   }
 
-  // FAgroups = tempGroups (Algorithm 2 line 33).
-  for (const auto& c : temp_groups) result.fa_groups.insert(c.group_id);
+  // --- Extension B Injection ---
+  // VIP access: Force-inject the extreme groups first.
+  for (uint64_t gid : pre_injected_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(gid);
+  }
+
+  // FAgroups = tempGroups (Algorithm 2 line 33), up to capacity.
+  for (const auto& c : temp_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(c.group_id);
+  }
 
   // Algorithm 2 lines 30–33 / patent col. 10: top up remaining FA slots with
   // heavy hitters (highest sample count) so C_s + C_h ≈ C_f.
