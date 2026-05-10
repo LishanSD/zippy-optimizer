@@ -93,8 +93,7 @@ int main(int argc, char* argv[]) {
     } else if (mode == "baseline") {
         metrics = run_zippy_baseline(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-a") {
-        fprintf(stderr, "ERROR: ext-a mode not yet implemented (Phase 5)\n");
-        return 1;
+        metrics = run_zippy_ext_a(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-b") {
         fprintf(stderr, "ERROR: ext-b mode not yet implemented (Phase 6)\n");
         return 1;
