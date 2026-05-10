@@ -48,7 +48,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 4A    | Sampler — uniform sampling + candidate selection (Algorithm 2) | ✅ Complete |
 | 4B    | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | ✅ Complete |
 | 4C    | MergeAndPrune + multi-pass convergence loop (full Algorithm 1) | ✅ Complete |
-| 5     | Extension A — Stratified sampling via group index              | 🔲 Planned  |
+| 5     | Extension A — Stratified sampling via group index              | ✅ Complete |
 | 6     | Extension B — Measure column index (min-heap)                  | 🔲 Planned  |
 | 7     | Combined mode (A + B) + full correctness sweep                 | 🔲 Planned  |
 | 8     | Experiment matrix + plots + documentation                      | 🔲 Planned  |
@@ -60,6 +60,9 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 - **FATable** — open-addressing hash table with linear probing (50% load factor, 16-byte entries for cache-line alignment)
 - **FMSketch** — 32-bucket stochastic averaging Flajolet-Martin distinct count
 - **CATable** — partition-level aggregate tracking with pruning and ranking
+- **GroupOccurrenceIndex** — single-scan index mapping each group_id to its row positions
+- **Stratified sampler** — two-phase sampling that boosts underrepresented rare groups
+- **Extension A (`--mode ext-a`)** — full stratified sampling pipeline, verified correct on S0
 
 ---
 
@@ -189,11 +192,15 @@ python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --output results/S0_baseline.json
 
-# 4) Run brute-force and baseline on S1
+# 4) Run ext-a on S0 and compare with brute-force
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a --output results/S0_ext_a.json --verbose
+
+# 5) Run brute-force and baseline on S1
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode brute-force --output results/S1_bf.json
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-a   --output results/S1_ext_a.json  --verbose
 
-# 5) Compare top-k ID sets + print baseline metrics
+# 6) Compare top-k ID sets + print baseline metrics
 python python/compare_phase4c_results.py
 ```
 
@@ -282,26 +289,43 @@ g++ -std=c++17 -O2 -o build/test_phase4b src/test_phase4b.cpp src/zippy.cpp src/
 ### viii. Run Phase 4C correctness gate (baseline vs brute-force)
 
 ```bash
-g++ -std=c++17 -O2 -o build/test_phase4c src/test_phase4c.cpp src/zippy.cpp src/sampler.cpp -Isrc/
+g++ -std=c++17 -O2 -o build/test_phase4c src/test_phase4c.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
 ./build/test_phase4c --input data/S0.bin --n-rows 10089 --k 10
 ```
 
-### ix. Run for different aggregate functions
+### ix. Run Phase 5 correctness gate (Extension A — Stratified Sampling)
+
+```bash
+g++ -std=c++17 -O2 -o build/test_phase5 src/test_phase5.cpp src/zippy.cpp src/sampler.cpp src/group_index.cpp src/stratified_sampler.cpp src/measure_index.cpp -Isrc/
+./build/test_phase5 --input data/S0.bin --n-rows 10089 --k 10
+```
+
+Expected output: `5 / 5 tests passed`. Verifies:
+- GroupOccurrenceIndex builds correctly (group counts, total rows)
+- Underrepresentation check logic
+- Stratified sampler returns valid FA candidates
+- ext-a top-k matches brute-force exactly
+- ext-a top-k matches baseline exactly (both correct)
+
+### x. Run for different aggregate functions
 
 Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify the aggregate function using the `--agg` flag.
 
 ```bash
 # Run baseline with SUM (default)
-./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg sum --output results/S0_sum.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --agg sum --output results/S0_sum.json
+
+# Run ext-a with SUM
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a --agg sum --output results/S0_ext_a_sum.json
 
 # Run baseline with MAX
-./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg max --output results/S0_max.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --agg max --output results/S0_max.json
 
 # Run baseline with MIN
-./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg min --output results/S0_min.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --agg min --output results/S0_min.json
 
 # Run baseline with COUNT
-./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg count --output results/S0_count.json
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline --agg count --output results/S0_count.json
 ```
 
 ---
