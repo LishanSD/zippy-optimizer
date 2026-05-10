@@ -1,7 +1,7 @@
 {
   "mode": "baseline",
   "k": 10,
-  "n_rows": 10089,
+  "n_rows": 10091,
   "n_groups": 0,
   "top_k_results": [
     {"group_id": 0, "aggregate": 174484.790032},
@@ -20,13 +20,18 @@
     "total_passes": 2,
     "sample_size_actual": 361,
     "fa_candidates_count": 167,
-    "sample_duration_ms": 0.872,
-    "pass1_duration_ms": 2.340,
-    "pass2plus_duration_ms": 1.477,
-    "total_duration_ms": 10.348,
+    "sample_duration_ms": 0.345,
+    "pass1_duration_ms": 1.848,
+    "pass2plus_duration_ms": 0.566,
+    "total_duration_ms": 7.494,
     "index_build_duration_ms": 0.000,
     "fa_hit_rate": -1.000000,
-    "topKBound_after_pass1": 20000.000000,
-    "partitions_pruned_pct": 0.931937
+    "topKBound_after_pass1": 30000.000000,
+    "partitions_pruned_pct": 0.984293,
+    "l_k_lower_bound": 432.026684,
+    "cs_above_lk": 10,
+    "partitions_exact_agg": 6,
+    "partitions_logical": 0,
+    "partitions_physical": 0
   }
 }
