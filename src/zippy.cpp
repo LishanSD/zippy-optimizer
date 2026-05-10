@@ -252,20 +252,7 @@ RunMetrics run_zippy_baseline(
         active_partitions.emplace(pid, ca.partition(pid));
     }
 
-    if (cfg.verbose) {
-        std::fprintf(stderr,
-                     "[baseline-pass1] topKBound=%.6f pruned=%.2f%% survivors=%zu\n",
-                     metrics.topKBound_after_pass1,
-                     metrics.partitions_pruned_pct * 100.0,
-                     active_partitions.size());
-        std::fprintf(stderr, "[baseline-pass1] FA candidates (%zu): ", out_fa_groups.size());
-        for (size_t i = 0; i < out_fa_groups.size(); ++i) {
-            std::fprintf(stderr,
-                         "%llu%s",
-                         static_cast<unsigned long long>(out_fa_groups[i]),
-                         (i + 1 < out_fa_groups.size()) ? "," : "\n");
-        }
-    }
+
 
     // Phase 4C: MergeAndPrune + multi-pass loop.
     int level = 2;  // Pass 2 children are hashed with child_partition_hash(..., pass=2).
