@@ -105,6 +105,7 @@ and handle everything else cheaply.
 - **Pass 1 union UB**: Pass 1 `topKBound` is K-th highest of `{FA exact values} ∪
   {partition UBs}`, matching Algorithm 4 line 12 (was previously FA-only).
 - **Brute-force comparator** generalised for all four aggregates.
+- **CLI parameters**: All tuning variables mentioned in the paper and patent (fa-capacity, n-partitions, sample-frac, delta, alpha-ci, beta-ci, alpha-locality, segment-size, underrep-threshold, boost-rows, measure-m) are fully exposed via CLI flags (`main.cpp`).
 
 ### What's deliberately NOT implemented (deferred)
 

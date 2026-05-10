@@ -286,39 +286,89 @@ g++ -std=c++17 -O2 -o build/test_phase4c src/test_phase4c.cpp src/zippy.cpp src/
 ./build/test_phase4c --input data/S0.bin --n-rows 10089 --k 10
 ```
 
+### ix. Run for different aggregate functions
+
+Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify the aggregate function using the `--agg` flag.
+
+```bash
+# Run baseline with SUM (default)
+./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg sum --output results/S0_sum.json
+
+# Run baseline with MAX
+./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg max --output results/S0_max.json
+
+# Run baseline with MIN
+./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg min --output results/S0_min.json
+
+# Run baseline with COUNT
+./build/zippy --input data/S0.bin --n-rows 10000 --k 10 --mode baseline --agg count --output results/S0_count.json
+```
+
 ---
 
 ## 9. CLI Reference
 
-```
+```bash
 ./build/zippy [OPTIONS]
-
-Required:
-  --input <path>          Path to binary dataset file
-  --n-rows <int>          Number of rows in dataset
-  --k <int>               Number of top results to return
-  --output <path>         Path to write JSON results file
-
-Algorithm selection:
-  --mode <string>         One of: brute-force | baseline | ext-a | ext-b | ext-ab
-
-Zippy tuning parameters:
-  --fa-capacity <int>     FA hash table capacity (default: 50000)
-  --n-partitions <int>    CA partition count (default: 10000)
-  --sample-frac <float>   Uniform sample fraction (default: 0.01)
-  --delta <float>         Sampling tolerance Δ (default: 0.05)
-
-Extension A parameters:
-  --underrep-threshold <float>  Underrepresentation threshold (default: 0.5)
-  --boost-rows <int>            Rows to fetch per boosted group (default: 10)
-
-Extension B parameters:
-  --measure-m <int>       Extreme-value rows to track (default: 500)
-
-Output options:
-  --verbose               Print per-pass stats to stderr
-  --output-fa-groups      Include FA group IDs in JSON output
 ```
+
+**Required:**
+- `--input <path>`: Path to binary dataset file
+- `--n-rows <int>`: Number of rows in dataset
+- `--k <int>`: Number of top results to return
+- `--output <path>`: Path to write JSON results file
+
+**Algorithm selection:**
+- `--mode <string>`: The algorithm execution mode to use. One of:
+  - `brute-force`: Exact hash aggregation over the entire dataset. Ground truth reference.
+  - `baseline`: Standard Zippy algorithm (Phase 4C).
+  - `ext-a`: Extension A (Stratified Sampling via group occurrence index).
+  - `ext-b`: Extension B (Measure Column Index for extreme values).
+  - `ext-ab`: Combined Extensions A and B.
+- `--agg <string>`: The aggregation function to use. One of: `sum`, `count`, `max`, `min`. (default: `sum`)
+
+**Zippy tuning parameters:**
+- `--fa-capacity <int>`: FA hash table capacity (Cf). Must be able to fit in L1/L2 cache. (default: `50000`)
+- `--n-partitions <int>`: Number of CA partitions (Cc). (default: `10000`)
+- `--sample-frac <float>`: Uniform random sampling fraction. (default: `0.01`)
+- `--delta <float>`: Sampling tolerance Δ. Groups below this proportion are ignored during candidate selection. (default: `0.05`)
+- `--alpha-ci <float>`: Confidence level α for sample size formula. (default: `0.05`)
+- `--beta-ci <float>`: Confidence level β for Hoeffding CI bounds during skew validation. (default: `0.95`)
+- `--alpha-locality <float>`: Locality threshold α₀ used to decide if exact aggregation should be used. (default: `0.20`)
+- `--segment-size <int>`: Rows per locality segment for the locality check. (default: `100000`)
+
+**Extension A parameters:**
+- `--underrep-threshold <float>`: Threshold for determining if a rare group is underrepresented. (default: `0.5`)
+- `--boost-rows <int>`: Number of rows to artificially sample for each boosted rare group. (default: `10`)
+
+**Extension B parameters:**
+- `--measure-m <int>`: Number of extreme-value rows to track in the min-heap. (default: `500`)
+
+**Output options:**
+- `--verbose`: Print per-pass statistics to stderr.
+- `--output-fa-groups`: Include the final FA group IDs in the JSON output.
+
+### Dataset Generator (`python/generate_data.py`)
+
+```bash
+python python/generate_data.py [OPTIONS]
+```
+
+**Required:**
+- `--output <path>`: Path to write the binary output dataset.
+- `--n-rows <int>`: Number of base rows to generate.
+- `--n-groups <int>`: Number of unique groups in the base Zipf distribution.
+
+**Distribution parameters:**
+- `--zipf-alpha <float>`: Zipf skew parameter. Higher values mean more skew. Must be > 0. (default: `1.2`)
+- `--value-distribution <string>`: Distribution of the values. One of: `exponential`, `uniform`, `constant`. (default: `exponential`)
+- `--value-scale <float>`: Mean/scale multiplier for the value distribution. (default: `100.0`)
+- `--seed <int>`: Random seed for reproducibility. (default: `42`)
+
+**Rare/Adversarial group injection:**
+- `--rare-group-fraction <float>`: Fraction of `n-groups` to create as rare high-value groups (adversarial pattern). 0.0 means none. (default: `0.0`)
+- `--rare-group-rows <int>`: Maximum number of rows per rare group. (default: `3`)
+- `--rare-group-value-multiplier <float>`: Multiplier applied to `value-scale` for rare group values. (default: `100.0`)
 
 ---
 
