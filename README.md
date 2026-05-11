@@ -49,8 +49,8 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 4B    | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | ✅ Complete |
 | 4C    | MergeAndPrune + multi-pass convergence loop (full Algorithm 1) | ✅ Complete |
 | 5     | Extension A — Stratified sampling via group index              | ✅ Complete |
-| 6     | Extension B — Measure column index (min-heap)                  | 🔲 Planned  |
-| 7     | Combined mode (A + B) + full correctness sweep                 | 🔲 Planned  |
+| 6     | Extension B — Measure column index (min-heap)                  | ✅ Complete |
+| 7     | Combined mode (A + B) + full correctness sweep                 | ✅ Complete |
 | 8     | Experiment matrix + plots + documentation                      | 🔲 Planned  |
 
 ### What's Working Now
@@ -62,7 +62,10 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 - **CATable** — partition-level aggregate tracking with pruning and ranking
 - **GroupOccurrenceIndex** — single-scan index mapping each group_id to its row positions
 - **Stratified sampler** — two-phase sampling that boosts underrepresented rare groups
-- **Extension A (`--mode ext-a`)** — full stratified sampling pipeline, verified correct on S0
+- **Extension A (`--mode ext-a`)** — full stratified sampling pipeline
+- **Extension B (`--mode ext-b`)** — full measure column index pipeline
+- **Combined mode (`--mode ext-ab`)** — implements both Extension A and B
+- **Correctness sweep** — Python verification script confirms all modes match brute-force
 
 ---
 
@@ -83,6 +86,7 @@ zippy-optimizer/
 │
 ├── python/                       Python orchestration layer
 │   ├── generate_data.py          Synthetic dataset generator (Zipf + rare groups)
+│   ├── run_all_modes.py          One-command build + 5-mode runner + combined report
 │   ├── run_experiments.py        Parameter sweeps, calls C++ binary (Phase 8)
 │   ├── plot_results.py           Matplotlib plots for results (Phase 8)
 │   ├── compare_phase4c_results.py Compare baseline vs brute-force outputs (Phase 4C)
@@ -182,11 +186,12 @@ This section uses three datasets of increasing difficulty to show the concrete i
 
 ### Dataset Overview
 
-| Dataset | Rows | Groups | Zipf α | Rare groups | Purpose |
-|---------|------|--------|--------|-------------|---------|
-| **S0** | ~10K | 500 | 1.2 | 10% (few rows, 100× value) | Quick correctness check |
-| **S1** | 10M | 1M | 1.2 | None | Shows Zippy speed vs brute-force |
-| **S2** | ~11M | 10M | 1.0 | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes |
+| Dataset         | Rows | Groups | Zipf α | Rare groups                                         | Purpose                                                            |
+| --------------- | ---- | ------ | ------ | --------------------------------------------------- | ------------------------------------------------------------------ |
+| **S0**          | ~10K | 500    | 1.2    | 10% (few rows, 100× value)                          | Quick correctness check                                            |
+| **S1**          | 10M  | 1M     | 1.2    | None                                                | Shows Zippy speed vs brute-force                                   |
+| **S2**          | ~11M | 10M    | 1.0    | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes      |
+| **monster_adv** | 100M | 10M    | 1.1    | 100 rare groups, 1 row each, 1,000,000× value       | Extreme "needle in a haystack" outliers to demonstrate Extension B |
 
 ### Step 1 — Build
 
@@ -209,17 +214,26 @@ python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups
 # boost. Single-row rare groups have expected sample count < 0.5 and are skipped
 # by design, so they are not a good Ext-A demo for this prototype.
 python python/generate_data.py --output data/S2.bin --n-rows 10000000 --n-groups 10000000 --zipf-alpha 1.0 --rare-group-fraction 0.00001 --rare-group-rows 20000 --rare-group-value-multiplier 10000 --seed 42
+
+# monster_adv: 100M-row adversarial dataset for Extension B. Single rows with extreme values.
+python python/generate_data.py --output data/monster_adv.bin --n-rows 100000000 --n-groups 10000000 --zipf-alpha 1.1 --rare-group-fraction 0.00001 --rare-group-rows 1 --rare-group-value-multiplier 1000000
 ```
 
 ### Step 3 — Correctness check on S0
 
 ```bash
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
+
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline    --output results/S0_baseline.json
+
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a       --output results/S0_ext_a.json
+
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-b       --output results/S0_ext_b.json
+
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-ab      --output results/S0_ext_ab.json
 ```
 
-All three should produce the same top-10 group IDs.
+All five should produce the same top-10 group IDs.
 
 ### Step 4 — Zippy efficiency on S1 (no rare groups)
 
@@ -229,15 +243,19 @@ All three should produce the same top-10 group IDs.
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
 
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-a --output results/S1_ext_a.json --verbose
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-b --output results/S1_ext_b.json --verbose
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-ab --output results/S1_ext_ab.json --verbose
 ```
 
 **What to look for in the metrics JSON:**
 
-| Metric | Brute-force | Baseline (expected) |
-|--------|-------------|---------------------|
-| `total_duration_ms` | ~1500 ms (Cache miss penalty) | **~400 ms** (3–4× faster) |
-| `partitions_pruned_pct` | — | **> 90%** |
-| `total_passes` | — | **1–2** |
+| Metric                  | Brute-force                   | Baseline (expected)       |
+| ----------------------- | ----------------------------- | ------------------------- |
+| `total_duration_ms`     | ~1500 ms (Cache miss penalty) | **~400 ms** (3–4× faster) |
+| `partitions_pruned_pct` | —                             | **> 90%**                 |
+| `total_passes`          | —                             | **1–2**                   |
 
 On S1 (no rare groups), baseline and ext-a should produce nearly identical results — the index build overhead is the only difference.
 
@@ -249,28 +267,106 @@ On S1 (no rare groups), baseline and ext-a should produce nearly identical resul
 ./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode baseline --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --output results/S2_baseline.json --verbose
 
 ./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-a --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000 --output results/S2_ext_a.json --verbose
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-b --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --output results/S2_ext_b.json --verbose
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-ab --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000 --output results/S2_ext_ab.json --verbose
 ```
 
 > **S2 row count:** With `--seed 42`, the generator produced exactly **11,027,264 rows**. If you regenerate with a different seed, use the `"n_rows"` value printed by `generate_data.py`.
 
 **What to look for:**
 
-| Metric | Brute-force | Baseline (expected) | ext-a (expected) |
-|--------|-------------|---------------------|------------------|
-| `total_duration_ms` | ~1300 ms | ~1050 ms | ~1800 ms including index build |
-| `topKBound_after_pass1` | — | ~7.7B | ~9.9B |
-| `partitions_pruned_pct` | — | ~90% | ~100% |
-| `total_passes` | — | 3 passes | 1 pass |
-| `pass2plus_duration_ms` | — | ~700 ms | ~0 ms |
-| `index_build_duration_ms` | 0.0 ms | 0.0 ms | ~1300 ms one-shot overhead |
+| Metric                    | Brute-force | Baseline (expected) | ext-a (expected)               |
+| ------------------------- | ----------- | ------------------- | ------------------------------ |
+| `total_duration_ms`       | ~1300 ms    | ~1050 ms            | ~1800 ms including index build |
+| `topKBound_after_pass1`   | —           | ~7.7B               | ~9.9B                          |
+| `partitions_pruned_pct`   | —           | ~90%                | ~100%                          |
+| `total_passes`            | —           | 3 passes            | 1 pass                         |
+| `pass2plus_duration_ms`   | —           | ~700 ms             | ~0 ms                          |
+| `index_build_duration_ms` | 0.0 ms      | 0.0 ms              | ~1300 ms one-shot overhead     |
 
-**Why can Ext-A still be slower in total duration?**
-`total_duration_ms` includes building the `GroupOccurrenceIndex` from scratch. On this prototype, the index is not persisted or reused, so Ext-A must first scan and materialize group positions before it can save later Zippy passes. The impact is visible in `topKBound_after_pass1`, `partitions_pruned_pct`, `total_passes`, and `pass2plus_duration_ms`; the wall-clock win appears only when the index is amortized across repeated queries or prebuilt outside the timed query path.
+### Step 6 — Extension B impact on monster_adv (extreme values)
+
+```bash
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode brute-force --output results/monster_bf.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode baseline --output results/monster_baseline.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-a --output results/monster_ext_a.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-b --output results/monster_ext_b.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-ab --output results/monster_ext_ab.json --verbose
+```
+
+**What to look for:**
+Because the outliers consist of only a single row, uniform sampling (baseline and `ext-a`) almost entirely misses them. Extension B's min-heap finds them perfectly, force-injects them into FA, and completely eliminates the need for further multi-pass scans. Ext-B achieves ~100% pruning and massive speedups. The combined mode (`ext-ab`) perfectly combines both indexes in a single pre-pass and is the most robust, showing identical convergence to `ext-b` here while protecting against S2-style workloads as well.
 
 ---
 
+## 8. One-Command All-Modes Report
 
-## 8. Run Each Phase
+Use `python/run_all_modes.py` when you want a single command that:
+
+1. Builds `build/zippy(.exe)`
+2. Runs all five modes: `brute-force`, `baseline`, `ext-a`, `ext-b`, `ext-ab`
+3. Uses one dataset / one `k` / one aggregate function
+4. Infers `n_rows` automatically from the dataset file size unless you override it
+5. Writes one combined JSON report containing:
+   - each mode's normal output (`top_k_results` + `metrics`)
+   - correctness comparisons against `brute-force`
+   - runtime ordering across modes
+
+### Basic command
+
+Required runner flags: `--input`, `--k`, and `--output`.
+Optional runner flags: `--agg` (defaults to `sum`).
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --agg sum --output results/S2_all_modes_sum.json
+```
+
+`--agg` defaults to `sum`, so this is also valid:
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --output results/S2_all_modes_sum.json
+```
+
+### Passing Zippy tuning flags through
+
+Any extra arguments after the known runner flags are forwarded to every `zippy` invocation. For example:
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --agg sum --output results/S2_all_modes_tuned.json --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000
+```
+
+### Useful options
+
+- `--n-rows <N>`: optional manual override if you do not want auto-detection
+- `--skip-build`: reuse the existing `build/zippy(.exe)` instead of rebuilding
+- `--compiler <name>`: choose a compiler other than `g++`
+- `--verbose`: pass `--verbose` through to each mode run
+- `--keep-mode-json`: keep the intermediate per-mode JSON files alongside the combined report
+
+### Windows note
+
+The commands above are written as single lines so they can be pasted directly into `cmd.exe` or PowerShell. The Unix-style trailing `\` line continuations are not valid in PowerShell.
+
+### Combined report structure
+
+The generated file contains:
+
+- `build`: compiler + build command used
+- `query`: dataset path, row count, `k`, aggregate, and forwarded Zippy args
+- `comparisons`: exact-result checks vs `brute-force`, aggregate-multiset checks, and duration rankings
+- `modes`: the full per-mode JSON output that `zippy` would normally write
+
+This makes it easy to archive one file per experiment instead of managing five separate mode outputs by hand.
+
+---
+
+## 9. Run Each Phase
 
 ### i. Build the C++ binary
 
@@ -347,6 +443,7 @@ g++ -std=c++17 -O2 -o build/test_phase5 src/test_phase5.cpp src/zippy.cpp src/sa
 ```
 
 Expected output: `5 / 5 tests passed`. Verifies:
+
 - GroupOccurrenceIndex builds correctly (group counts, total rows)
 - Underrepresentation check logic
 - Stratified sampler returns valid FA candidates
@@ -376,19 +473,21 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 
 ---
 
-## 9. CLI Reference
+## 10. CLI Reference
 
 ```bash
 ./build/zippy [OPTIONS]
 ```
 
 **Required:**
+
 - `--input <path>`: Path to binary dataset file
 - `--n-rows <int>`: Number of rows in dataset
 - `--k <int>`: Number of top results to return
 - `--output <path>`: Path to write JSON results file
 
 **Algorithm selection:**
+
 - `--mode <string>`: The algorithm execution mode to use. One of:
   - `brute-force`: Exact hash aggregation over the entire dataset. Ground truth reference.
   - `baseline`: Standard Zippy algorithm (Phase 4C).
@@ -398,6 +497,7 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 - `--agg <string>`: The aggregation function to use. One of: `sum`, `count`, `max`, `min`. (default: `sum`)
 
 **Zippy tuning parameters:**
+
 - `--fa-capacity <int>`: FA hash table capacity (Cf). Must be able to fit in L1/L2 cache. (default: `50000`)
 - `--n-partitions <int>`: Number of CA partitions (Cc). (default: `10000`)
 - `--sample-frac <float>`: Uniform random sampling fraction. (default: `0.01`)
@@ -408,13 +508,16 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 - `--segment-size <int>`: Rows per locality segment for the locality check. (default: `100000`)
 
 **Extension A parameters:**
+
 - `--underrep-threshold <float>`: Threshold for determining if a rare group is underrepresented. (default: `0.5`)
 - `--boost-rows <int>`: Number of rows to artificially sample for each boosted rare group. (default: `10`)
 
 **Extension B parameters:**
+
 - `--measure-m <int>`: Number of extreme-value rows to track in the min-heap. (default: `500`)
 
 **Output options:**
+
 - `--verbose`: Print per-pass statistics to stderr.
 - `--output-fa-groups`: Include the final FA group IDs in the JSON output.
 
@@ -425,24 +528,27 @@ python python/generate_data.py [OPTIONS]
 ```
 
 **Required:**
+
 - `--output <path>`: Path to write the binary output dataset.
 - `--n-rows <int>`: Number of base rows to generate.
 - `--n-groups <int>`: Number of unique groups in the base Zipf distribution.
 
 **Distribution parameters:**
+
 - `--zipf-alpha <float>`: Zipf skew parameter. Higher values mean more skew. Must be > 0. (default: `1.2`)
 - `--value-distribution <string>`: Distribution of the values. One of: `exponential`, `uniform`, `constant`. (default: `exponential`)
 - `--value-scale <float>`: Mean/scale multiplier for the value distribution. (default: `100.0`)
 - `--seed <int>`: Random seed for reproducibility. (default: `42`)
 
 **Rare/Adversarial group injection:**
+
 - `--rare-group-fraction <float>`: Fraction of `n-groups` to create as rare high-value groups (adversarial pattern). 0.0 means none. (default: `0.0`)
 - `--rare-group-rows <int>`: Maximum number of rows per rare group. (default: `3`)
 - `--rare-group-value-multiplier <float>`: Multiplier applied to `value-scale` for rare group values. (default: `100.0`)
 
 ---
 
-## 10. Dataset Format
+## 11. Dataset Format
 
 Binary format, 16 bytes per row, little-endian, no header:
 
@@ -454,7 +560,7 @@ Total file size = `n_rows × 16` bytes.
 
 ---
 
-## 11. Output Format
+## 12. Output Format
 
 JSON with top-k results and performance metrics:
 
@@ -478,7 +584,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 12. Key Metrics
+## 13. Key Metrics
 
 | Metric                  | Description                                                |
 | ----------------------- | ---------------------------------------------------------- |
@@ -490,7 +596,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 13. How Zippy Works (Simplified)
+## 14. How Zippy Works (Simplified)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -512,7 +618,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 14. References
+## 15. References
 
 - **Paper:** Siddiqui et al., "Cache-Efficient Top-k Aggregation over High Cardinality Large Datasets", PVLDB 17(4), 2023. DOI: [10.14778/3636218.3636222](https://doi.org/10.14778/3636218.3636222)
 - **Patent:** US 12380098 / Application 20250103591 (implementation details)

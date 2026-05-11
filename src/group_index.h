@@ -11,19 +11,34 @@
 #include "data_structures.h"
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
+struct GroupOccurrenceEntry {
+    size_t                row_count = 0;
+    std::vector<uint64_t> positions;
+};
+
 class GroupOccurrenceIndex {
-    // Maps group_id → sorted list of 0-based row positions in the dataset.
-    // Built in one sequential scan — O(N) time and O(N) memory.
-    std::unordered_map<uint64_t, std::vector<uint64_t>> index_;
+    // Maps group_id → total row count plus a capped prefix of row positions.
+    // The stored positions are only used to fetch boost rows later, so callers
+    // can cap how many positions we retain per group to reduce index cost.
+    std::unordered_map<uint64_t, GroupOccurrenceEntry> entries_;
     size_t total_rows_ = 0;
 
 public:
     // Build the index from the dataset's group_id column.
-    // Stores every row position for every group — one sequential scan.
-    void build(const std::vector<Row>& dataset);
+    // `max_positions_per_group` may be used to retain only the first N row
+    // positions per group while still tracking the true row count.
+    void build(const std::vector<Row>& dataset,
+               size_t max_positions_per_group = std::numeric_limits<size_t>::max());
+
+    // Incremental build API used by ext-ab to share one scan across indices.
+    void reset(size_t total_rows, size_t estimated_groups = 0);
+    void add_occurrence(uint64_t group_id,
+                        uint64_t row_position,
+                        size_t   max_positions_per_group = std::numeric_limits<size_t>::max());
 
     // Returns true if the group was significantly underrepresented in the
     // uniform sample, i.e.:
@@ -45,7 +60,7 @@ public:
     std::vector<uint64_t> get_boost_rows(uint64_t group_id, size_t n_boost) const;
 
     // Number of distinct groups in the index.
-    size_t group_count() const { return index_.size(); }
+    size_t group_count() const { return entries_.size(); }
 
     // Total rows in the indexed dataset.
     size_t total_rows() const { return total_rows_; }
@@ -54,7 +69,7 @@ public:
     size_t row_count_for(uint64_t group_id) const;
 
     // Iteration support — provides read-only access to the full index map.
-    const std::unordered_map<uint64_t, std::vector<uint64_t>>& index() const {
-        return index_;
+    const std::unordered_map<uint64_t, GroupOccurrenceEntry>& entries() const {
+        return entries_;
     }
 };

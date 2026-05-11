@@ -97,8 +97,7 @@ int main(int argc, char* argv[]) {
     } else if (mode == "ext-b") {
         metrics = run_zippy_ext_b(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-ab") {
-        fprintf(stderr, "ERROR: ext-ab mode not yet implemented (Phase 7)\n");
-        return 1;
+        metrics = run_zippy_ext_ab(dataset, k, cfg, results, fa_groups);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode.c_str());
         return 1;
