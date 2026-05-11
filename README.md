@@ -9,7 +9,7 @@ A C++17 implementation of the **Zippy** algorithm for cache-efficient top-k aggr
 
 ## 1. What Problem Does This Solve?
 
-Consider a query like:
+Consider a query like
 
 ```sql
 SELECT salesperson, SUM(revenue)
