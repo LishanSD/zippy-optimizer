@@ -74,19 +74,61 @@ namespace
 
 } // namespace
 
+// Hoeffding half-width on the per-tuple mean of values for one group:
+//   ε = (b - a) · sqrt( ln(2/(1-β)) / (2 n_i') )
+// (paper §4.2.1, patent description col. 9). For SUM aggregate, the LB on
+// the group's sum-in-sample is sample_sum - ε · n_i'.
+static double hoeffding_eps_per_tuple(double a, double b, double beta_ci, double n_i_prime)
+{
+  if (n_i_prime <= 0.0) return 0.0;
+  const double safe_beta = (beta_ci > 0.0 && beta_ci < 1.0) ? beta_ci : 0.95;
+  const double range     = (b > a) ? (b - a) : 0.0;
+  if (range == 0.0) return 0.0;
+  const double ln_term = std::log(2.0 / (1.0 - safe_beta));
+  return range * std::sqrt(ln_term / (2.0 * n_i_prime));
+}
+
+// LB on the aggregate VALUE of a group within the sample, per `f`.
+// Used as the comparator for L_k (paper Algorithm 2 line 19, patent claim 7).
+static double aggregate_lower_bound(const SampleGroupStats& s, AggFunc f, double beta_ci)
+{
+  switch (f) {
+    case AggFunc::SUM: {
+      const double eps = hoeffding_eps_per_tuple(s.min_val, s.max_val, beta_ci, s.count);
+      return s.sum - eps * s.count;
+    }
+    case AggFunc::COUNT:
+      // Sample count is exact for the sample population — point estimate is its
+      // own (trivial) lower bound; rigorous extrapolation requires N_i which we
+      // do not know.  Order-preserving for top-K selection.
+      return s.count;
+    case AggFunc::MAX:
+      // Sample max ≤ true max ⇒ sample max IS a valid lower bound on group MAX.
+      return s.max_val;
+    case AggFunc::MIN:
+      // Sample min ≥ true min — strictly an upper bound. Used as a heuristic
+      // ranking signal for top-K-by-MIN; full β/2-percentile CI (paper §4.2.1)
+      // is left as future work.
+      return s.min_val;
+  }
+  return 0.0;
+}
+
 SampleResult uniform_sample_and_select(
     const std::vector<Row> &dataset,
     size_t fa_capacity,
+    int    k,
+    AggFunc agg_func,
     double sample_frac,
     double delta,
     double alpha_ci,
     double beta_ci,
-    uint64_t seed)
+    uint64_t seed,
+    const std::unordered_set<uint64_t>& pre_injected_groups
+  )
 {
-  (void)beta_ci; // TODO: use beta_ci when full Hoeffding CI bounds are implemented.
-
   SampleResult result;
-  if (dataset.empty() || fa_capacity == 0)
+  if (dataset.empty() || fa_capacity == 0 || k <= 0)
   {
     result.is_optimizable = false;
     return result;
@@ -106,18 +148,19 @@ SampleResult uniform_sample_and_select(
   if (sample_size_target > n_rows)
     sample_size_target = n_rows;
 
-  const double p = static_cast<double>(sample_size_target) / static_cast<double>(n_rows);
-
   std::mt19937_64 rng(seed);
-  std::bernoulli_distribution select(p);
+  
+  // 1. DEFINE the uniform distribution to pick random array indices
+  std::uniform_int_distribution<size_t> dist(0, n_rows - 1);
 
   result.sample_stats.reserve(std::min(sample_size_target * 2, n_rows));
 
-  for (const auto &row : dataset)
-  {
-    if (!select(rng))
-      continue;
+  // 2. Loop EXACTLY sample_size_target times
+  for (size_t i = 0; i < sample_size_target; ++i) {
+    // 3. O(1) random access
+    const auto& row = dataset[dist(rng)];
 
+    // 4. NO COIN FLIP! Update stats directly.
     auto &stats = result.sample_stats[row.group_id];
     stats.sum += row.value;
     stats.count += 1.0;
@@ -125,6 +168,7 @@ SampleResult uniform_sample_and_select(
       stats.min_val = row.value;
     if (row.value > stats.max_val)
       stats.max_val = row.value;
+      
     ++result.sample_size_actual;
   }
 
@@ -134,62 +178,119 @@ SampleResult uniform_sample_and_select(
     return result;
   }
 
+  // ── Algorithm 2 lines 17–20: compute lower bounds and L_k ────────────────
   struct Candidate
   {
     uint64_t group_id;
-    double sum;
-    double count;
+    double   lb;       // aggregate-value lower bound
+    double   count;    // sample count (heavy-hitter tiebreaker)
   };
 
   std::vector<Candidate> candidates;
   candidates.reserve(result.sample_stats.size());
   for (const auto &[gid, stats] : result.sample_stats)
   {
-    candidates.push_back(Candidate{gid, stats.sum, stats.count});
+    candidates.push_back(Candidate{
+        gid,
+        aggregate_lower_bound(stats, agg_func, beta_ci),
+        stats.count});
   }
 
-  // TODO: replace point estimates with Hoeffding lower bounds for candidate selection.
-  std::sort(candidates.begin(), candidates.end(),
-            [](const Candidate &a, const Candidate &b)
-            {
-              if (a.sum != b.sum)
-                return a.sum > b.sum;
-              if (a.count != b.count)
-                return a.count > b.count;
-              return a.group_id < b.group_id;
-            });
-
-  const size_t top_by_sum = std::min(fa_capacity, candidates.size());
-  for (size_t i = 0; i < top_by_sum; ++i)
+  // L_k = K-th highest lower bound.
+  const size_t k_size = static_cast<size_t>(k);
+  double l_k = 0.0;
+  if (candidates.size() >= k_size && k_size > 0)
   {
-    result.fa_groups.insert(candidates[i].group_id);
+    std::vector<double> lbs;
+    lbs.reserve(candidates.size());
+    for (const auto& c : candidates) lbs.push_back(c.lb);
+    std::nth_element(lbs.begin(), lbs.begin() + (k_size - 1), lbs.end(),
+                     std::greater<double>());
+    l_k = lbs[k_size - 1];
   }
+  result.l_k_lower_bound = l_k;
 
-  const size_t cf_bytes = fa_capacity * sizeof(FAEntry);
-  const size_t cs_bytes = result.fa_groups.size() * sizeof(FAEntry);
-  if (cs_bytes > cf_bytes)
+  // tempGroups = {g : LB(g) ≥ L_k}.  Algorithm 2 line 22.
+  std::vector<Candidate> temp_groups;
+  temp_groups.reserve(candidates.size());
+  for (const auto& c : candidates)
+  {
+    if (c.lb >= l_k) temp_groups.push_back(c);
+  }
+  result.cs_above_lk = temp_groups.size();
+
+  // Algorithm 2 lines 23–26 / patent col. 10: if C_s > C_f, the sample skew is
+  // insufficient — skip the optimization entirely.
+  if (temp_groups.size() > fa_capacity)
   {
     result.is_optimizable = false;
-    result.fa_groups.clear();
     return result;
   }
 
+  // ── Skew validation gate (claim 2 / 12) ───────────────────────────────────
+  // Independent signal: if the top-K sample aggregate accounts for a vanishing
+  // share of total sample aggregate, the distribution is not skewed enough for
+  // top-K optimization to be worthwhile.
+  if (agg_func == AggFunc::SUM || agg_func == AggFunc::COUNT)
+  {
+    double total_agg = 0.0;
+    std::vector<double> per_group_agg;
+    per_group_agg.reserve(result.sample_stats.size());
+    for (const auto &[gid, stats] : result.sample_stats)
+    {
+      (void)gid;
+      const double v = (agg_func == AggFunc::SUM) ? stats.sum : stats.count;
+      per_group_agg.push_back(v);
+      total_agg += v;
+    }
+    if (total_agg > 0.0 && !per_group_agg.empty())
+    {
+      const size_t take = std::min(k_size, per_group_agg.size());
+      std::nth_element(per_group_agg.begin(),
+                       per_group_agg.begin() + take,
+                       per_group_agg.end(),
+                       std::greater<double>());
+      double top_k_share = 0.0;
+      for (size_t i = 0; i < take; ++i) top_k_share += per_group_agg[i];
+      // If top-K aggregates contribute less than 1% of total, distribution is
+      // ~uniform — fall back.
+      if (top_k_share / total_agg < 0.01)
+      {
+        result.is_optimizable = false;
+        return result;
+      }
+    }
+  }
+
+  // --- Extension B Injection ---
+  // VIP access: Force-inject the extreme groups first.
+  for (uint64_t gid : pre_injected_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(gid);
+  }
+
+  // FAgroups = tempGroups (Algorithm 2 line 33), up to capacity.
+  for (const auto& c : temp_groups) {
+      if (result.fa_groups.size() >= fa_capacity) break;
+      result.fa_groups.insert(c.group_id);
+  }
+
+  // Algorithm 2 lines 30–33 / patent col. 10: top up remaining FA slots with
+  // heavy hitters (highest sample count) so C_s + C_h ≈ C_f.
   if (result.fa_groups.size() < fa_capacity)
   {
-    std::sort(candidates.begin(), candidates.end(),
+    std::vector<Candidate> sorted_by_count = candidates;
+    std::sort(sorted_by_count.begin(), sorted_by_count.end(),
               [](const Candidate &a, const Candidate &b)
               {
-                if (a.count != b.count)
-                  return a.count > b.count;
-                if (a.sum != b.sum)
-                  return a.sum > b.sum;
+                if (a.count != b.count) return a.count > b.count;
+                if (a.lb    != b.lb)    return a.lb    > b.lb;
                 return a.group_id < b.group_id;
               });
 
-    for (const auto &c : candidates)
+    for (const auto &c : sorted_by_count)
     {
-      if (result.fa_groups.size() >= fa_capacity)
-        break;
+      if (result.fa_groups.size() >= fa_capacity) break;
       result.fa_groups.insert(c.group_id);
     }
   }

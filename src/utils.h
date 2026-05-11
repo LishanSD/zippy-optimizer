@@ -31,6 +31,14 @@ struct RunMetrics {
     double fa_hit_rate          = -1;   // -1 = not computed (needs --output-fa-groups)
     double topKBound_after_pass1= 0;
     double partitions_pruned_pct= 0;
+
+    // Algorithm 2 / patent claim 7
+    double l_k_lower_bound      = 0;    // K-th highest Hoeffding LB across sampled groups
+    size_t cs_above_lk          = 0;    // |{g : LB(g) ≥ L_k}|
+    // Adaptive partitioning (Algorithm 3 / patent claims 3, 4, 13, 14)
+    size_t partitions_exact_agg = 0;    // FM<CF or locality < α₀
+    size_t partitions_logical   = 0;    // C_p/Q < T_c
+    size_t partitions_physical  = 0;    // otherwise
 };
 
 // ── JSON writer (no external library) ─────────────────────────────────────
@@ -82,7 +90,12 @@ inline void write_output_json(
     fprintf(f, "    \"index_build_duration_ms\": %.3f,\n", m.index_build_duration_ms);
     fprintf(f, "    \"fa_hit_rate\": %.6f,\n", m.fa_hit_rate);
     fprintf(f, "    \"topKBound_after_pass1\": %.6f,\n", m.topKBound_after_pass1);
-    fprintf(f, "    \"partitions_pruned_pct\": %.6f\n", m.partitions_pruned_pct);
+    fprintf(f, "    \"partitions_pruned_pct\": %.6f,\n", m.partitions_pruned_pct);
+    fprintf(f, "    \"l_k_lower_bound\": %.6f,\n", m.l_k_lower_bound);
+    fprintf(f, "    \"cs_above_lk\": %zu,\n", m.cs_above_lk);
+    fprintf(f, "    \"partitions_exact_agg\": %zu,\n", m.partitions_exact_agg);
+    fprintf(f, "    \"partitions_logical\": %zu,\n", m.partitions_logical);
+    fprintf(f, "    \"partitions_physical\": %zu\n", m.partitions_physical);
     fprintf(f, "  }\n}\n");
     fclose(f);
 }

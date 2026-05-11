@@ -85,6 +85,8 @@ int main() {
     const SampleResult sample = uniform_sample_and_select(
         dataset,
         cfg.fa_capacity,
+        K,
+        cfg.agg_func,
         cfg.sample_frac,
         cfg.delta,
         cfg.alpha_ci,
@@ -109,10 +111,23 @@ int main() {
         }
     }
 
-    const auto fa_topk = fa.top_k(static_cast<size_t>(K));
-    const double topKBound =
-        (fa_topk.size() >= static_cast<size_t>(K)) ? fa_topk[K - 1].second : 0.0;
-    ca.prune(topKBound);
+    // Algorithm 4 line 12: K-th highest among {FA exact values} ∪ {partition UBs}.
+    std::vector<double> union_values;
+    {
+        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        for (const auto& [gid, val] : fa_all) { (void)gid; union_values.push_back(val); }
+        for (size_t pid = 0; pid < ca.n_partitions(); ++pid) {
+            const CAPartition& part = ca.partition(pid);
+            if (part.count > 0) union_values.push_back(part.upper_bound(cfg.agg_func));
+        }
+    }
+    double topKBound = 0.0;
+    if (union_values.size() >= static_cast<size_t>(K)) {
+        std::nth_element(union_values.begin(), union_values.begin() + (K - 1),
+                         union_values.end(), std::greater<double>());
+        topKBound = union_values[K - 1];
+    }
+    ca.prune(topKBound, cfg.agg_func);
 
     const auto survivors = ca.surviving_partitions();
     const double pruned_pct = ca.pruning_fraction();

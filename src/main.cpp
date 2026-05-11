@@ -26,12 +26,15 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "--mode"))         mode        = argv[++i];
         else if (!strcmp(argv[i], "--n-rows"))       n_rows      = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--k"))            k           = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--agg"))          cfg.agg_func = parse_agg_func(argv[++i]);
         else if (!strcmp(argv[i], "--fa-capacity"))  cfg.fa_capacity   = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--n-partitions")) cfg.n_partitions  = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--sample-frac"))  cfg.sample_frac   = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--delta"))        cfg.delta         = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--alpha-ci"))     cfg.alpha_ci      = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--beta-ci"))      cfg.beta_ci       = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--alpha-locality")) cfg.alpha_locality = std::stod(argv[++i]);
+        else if (!strcmp(argv[i], "--segment-size"))  cfg.segment_size  = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--underrep-threshold")) cfg.underrep_threshold = std::stod(argv[++i]);
         else if (!strcmp(argv[i], "--boost-rows"))   cfg.boost_rows    = std::stoull(argv[++i]);
         else if (!strcmp(argv[i], "--measure-m"))    cfg.measure_m     = std::stoull(argv[++i]);
@@ -84,20 +87,17 @@ int main(int argc, char* argv[]) {
     total_timer.reset();
 
     if (mode == "brute-force") {
-        results = run_brute_force(dataset, k);
+        results = run_brute_force(dataset, k, cfg.agg_func);
         metrics.total_duration_ms = total_timer.elapsed_ms();
         metrics.is_optimizable = true;   // brute-force always "works"
     } else if (mode == "baseline") {
         metrics = run_zippy_baseline(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-a") {
-        fprintf(stderr, "ERROR: ext-a mode not yet implemented (Phase 5)\n");
-        return 1;
+        metrics = run_zippy_ext_a(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-b") {
-        fprintf(stderr, "ERROR: ext-b mode not yet implemented (Phase 6)\n");
-        return 1;
+        metrics = run_zippy_ext_b(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-ab") {
-        fprintf(stderr, "ERROR: ext-ab mode not yet implemented (Phase 7)\n");
-        return 1;
+        metrics = run_zippy_ext_ab(dataset, k, cfg, results, fa_groups);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode.c_str());
         return 1;
