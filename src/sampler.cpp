@@ -1,4 +1,5 @@
 #include "sampler.h"
+#include "math_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,87 +7,8 @@
 #include <random>
 #include <vector>
 
-namespace
-{
-
-  // Acklam approximation for inverse CDF of the standard normal distribution.
-  double inverse_standard_normal_cdf(double p)
-  {
-    static constexpr double a1 = -3.969683028665376e+01;
-    static constexpr double a2 = 2.209460984245205e+02;
-    static constexpr double a3 = -2.759285104469687e+02;
-    static constexpr double a4 = 1.383577518672690e+02;
-    static constexpr double a5 = -3.066479806614716e+01;
-    static constexpr double a6 = 2.506628277459239e+00;
-
-    static constexpr double b1 = -5.447609879822406e+01;
-    static constexpr double b2 = 1.615858368580409e+02;
-    static constexpr double b3 = -1.556989798598866e+02;
-    static constexpr double b4 = 6.680131188771972e+01;
-    static constexpr double b5 = -1.328068155288572e+01;
-
-    static constexpr double c1 = -7.784894002430293e-03;
-    static constexpr double c2 = -3.223964580411365e-01;
-    static constexpr double c3 = -2.400758277161838e+00;
-    static constexpr double c4 = -2.549732539343734e+00;
-    static constexpr double c5 = 4.374664141464968e+00;
-    static constexpr double c6 = 2.938163982698783e+00;
-
-    static constexpr double d1 = 7.784695709041462e-03;
-    static constexpr double d2 = 3.224671290700398e-01;
-    static constexpr double d3 = 2.445134137142996e+00;
-    static constexpr double d4 = 3.754408661907416e+00;
-
-    static constexpr double p_low = 0.02425;
-    static constexpr double p_high = 1.0 - p_low;
-
-    if (p <= 0.0)
-      return -INFINITY;
-    if (p >= 1.0)
-      return INFINITY;
-
-    if (p < p_low)
-    {
-      const double q = std::sqrt(-2.0 * std::log(p));
-      return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
-             ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
-    }
-    if (p <= p_high)
-    {
-      const double q = p - 0.5;
-      const double r = q * q;
-      return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
-             (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
-    }
-
-    const double q = std::sqrt(-2.0 * std::log(1.0 - p));
-    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
-           ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
-  }
-
-  double z_alpha_over_two(double alpha_ci)
-  {
-    const double alpha =
-        (alpha_ci > 0.0 && alpha_ci < 1.0) ? alpha_ci : 0.05; // default fallback
-    const double p = 1.0 - (alpha / 2.0);
-    return inverse_standard_normal_cdf(p);
-  }
-
-} // namespace
-
-// Hoeffding half-width on the per-tuple mean of values for one group:
-//   ε = (b - a) · sqrt( ln(2/(1-β)) / (2 n_i') )
-// (paper §4.2.1, patent description col. 9). For SUM aggregate, the LB on
-// the group's sum-in-sample is sample_sum - ε · n_i'.
-static double hoeffding_eps_per_tuple(double a, double b, double beta_ci, double n_i_prime)
-{
-  if (n_i_prime <= 0.0) return 0.0;
-  const double safe_beta = (beta_ci > 0.0 && beta_ci < 1.0) ? beta_ci : 0.95;
-  const double range     = (b > a) ? (b - a) : 0.0;
-  if (range == 0.0) return 0.0;
-  const double ln_term = std::log(2.0 / (1.0 - safe_beta));
-  return range * std::sqrt(ln_term / (2.0 * n_i_prime));
-}
+using zippy_math::z_alpha_over_two;
+using zippy_math::hoeffding_eps_per_tuple;
 
 // LB on the aggregate VALUE of a group within the sample, per `f`.
 // Used as the comparator for L_k (paper Algorithm 2 line 19, patent claim 7).
@@ -149,26 +71,23 @@ SampleResult uniform_sample_and_select(
     sample_size_target = n_rows;
 
   std::mt19937_64 rng(seed);
-  
-  // 1. DEFINE the uniform distribution to pick random array indices
-  std::uniform_int_distribution<size_t> dist(0, n_rows - 1);
+
+  // Bernoulli sampling: each row is independently included with probability p,
+  // matching Algorithm 2 and patent col. 9. This ensures n_i' counts distinct
+  // rows sampled per group, which the Hoeffding CI formula requires.
+  const double p_row = static_cast<double>(sample_size_target)
+                     / static_cast<double>(n_rows);
+  std::bernoulli_distribution coin(p_row);
 
   result.sample_stats.reserve(std::min(sample_size_target * 2, n_rows));
 
-  // 2. Loop EXACTLY sample_size_target times
-  for (size_t i = 0; i < sample_size_target; ++i) {
-    // 3. O(1) random access
-    const auto& row = dataset[dist(rng)];
-
-    // 4. NO COIN FLIP! Update stats directly.
-    auto &stats = result.sample_stats[row.group_id];
-    stats.sum += row.value;
+  for (const auto& row : dataset) {
+    if (!coin(rng)) continue;
+    auto& stats = result.sample_stats[row.group_id];
+    stats.sum   += row.value;
     stats.count += 1.0;
-    if (row.value < stats.min_val)
-      stats.min_val = row.value;
-    if (row.value > stats.max_val)
-      stats.max_val = row.value;
-      
+    if (row.value < stats.min_val) stats.min_val = row.value;
+    if (row.value > stats.max_val) stats.max_val = row.value;
     ++result.sample_size_actual;
   }
 
@@ -231,7 +150,6 @@ SampleResult uniform_sample_and_select(
   // Independent signal: if the top-K sample aggregate accounts for a vanishing
   // share of total sample aggregate, the distribution is not skewed enough for
   // top-K optimization to be worthwhile.
-  if (agg_func == AggFunc::SUM || agg_func == AggFunc::COUNT)
   {
     double total_agg = 0.0;
     std::vector<double> per_group_agg;
@@ -239,7 +157,7 @@ SampleResult uniform_sample_and_select(
     for (const auto &[gid, stats] : result.sample_stats)
     {
       (void)gid;
-      const double v = (agg_func == AggFunc::SUM) ? stats.sum : stats.count;
+      const double v = std::abs(aggregate_lower_bound(stats, agg_func, beta_ci));
       per_group_agg.push_back(v);
       total_agg += v;
     }

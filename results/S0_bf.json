@@ -33,11 +33,5 @@
     "partitions_exact_agg": 0,
     "partitions_logical": 0,
     "partitions_physical": 0
-    "partitions_pruned_pct": 0.000000,
-    "l_k_lower_bound": 0.000000,
-    "cs_above_lk": 0,
-    "partitions_exact_agg": 0,
-    "partitions_logical": 0,
-    "partitions_physical": 0
   }
 }

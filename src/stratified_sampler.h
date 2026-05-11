@@ -23,36 +23,40 @@
 
 #include "sampler.h"
 #include "group_index.h"
+#include <unordered_set>
 
 // Perform two-phase stratified sampling and FA candidate selection.
 //
 // Parameters (all shared with uniform_sample_and_select unless noted):
-//   dataset        — full in-memory dataset
-//   group_index    — pre-built GroupOccurrenceIndex (one scan)
-//   fa_capacity    — max FA slots (Cf)
-//   k              — top-K parameter (for L_k computation)
-//   agg_func       — aggregate function
-//   sample_frac    — Phase 1 uniform fraction (default 0.01)
-//   delta          — sampling tolerance Δ (for sample-size formula)
-//   alpha_ci       — CI confidence level (for sample-size formula)
-//   beta_ci        — Hoeffding CI confidence (for lower-bound computation)
-//   underrep_threshold — fraction below expected that triggers a boost (e.g. 0.5)
-//   boost_rows     — max additional rows to fetch per underrepresented group
-//   seed           — RNG seed for reproducibility
+//   dataset              — full in-memory dataset
+//   group_index          — pre-built GroupOccurrenceIndex (one scan)
+//   fa_capacity          — max FA slots (Cf)
+//   k                    — top-K parameter (for L_k computation)
+//   agg_func             — aggregate function
+//   sample_frac          — Phase 1 uniform fraction (default 0.01)
+//   delta                — sampling tolerance Δ (for sample-size formula)
+//   alpha_ci             — CI confidence level (for sample-size formula)
+//   beta_ci              — Hoeffding CI confidence (for lower-bound computation)
+//   underrep_threshold   — fraction below expected that triggers a boost (e.g. 0.5)
+//   boost_rows           — max additional rows to fetch per underrepresented group
+//   seed                 — RNG seed for reproducibility
+//   pre_injected_groups  — groups to force-insert into FA before tempGroups
+//                          (Extension B measure-index injection for ext-ab mode)
 //
 // Returns:
 //   SampleResult with the same fields as uniform_sample_and_select(), plus
 //   sample_stats updated to include Phase 2 boost rows.
 SampleResult stratified_sample_and_select(
-    const std::vector<Row>&         dataset,
-    const GroupOccurrenceIndex&     group_index,
-    size_t                          fa_capacity,
-    int                             k,
-    AggFunc                         agg_func,
-    double                          sample_frac,
-    double                          delta,
-    double                          alpha_ci,
-    double                          beta_ci,
-    double                          underrep_threshold,
-    size_t                          boost_rows,
-    uint64_t                        seed = 42);
+    const std::vector<Row>&                dataset,
+    const GroupOccurrenceIndex&            group_index,
+    size_t                                 fa_capacity,
+    int                                    k,
+    AggFunc                                agg_func,
+    double                                 sample_frac,
+    double                                 delta,
+    double                                 alpha_ci,
+    double                                 beta_ci,
+    double                                 underrep_threshold,
+    size_t                                 boost_rows,
+    uint64_t                               seed = 42,
+    const std::unordered_set<uint64_t>&    pre_injected_groups = {});

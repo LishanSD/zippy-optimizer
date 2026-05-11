@@ -326,6 +326,11 @@ struct CAPartition {
     FMSketch fm;                                                 // approx distinct groups (FA gating)
     bool     pruned    = false;                                  // pruned flag
 
+    // Segmented locality tracking (paper §4.3, patent col. 11).
+    // Populated by CATable::update_with_segment when segment_size > 0.
+    std::vector<FMSketch>  segment_sketches;  // per-segment distinct-group sketch
+    std::vector<uint64_t>  segment_counts;    // per-segment row count
+
     // Per-aggregate upper bound used by MergeAndPrune (Algorithm 4 line 12).
     // Patent description col. 13: SUM/AVG bounded by partition.total_sum;
     // MAX/MIN bounded by partition.max_value; COUNT bounded by partition.count.
@@ -383,6 +388,27 @@ public:
         if (val < part.min_value) part.min_value = val;
         part.count++;
         part.fm.update(group_id);
+    }
+
+    // Variant that also tracks per-segment distinct counts for segmented locality.
+    // row_idx is the absolute row index in the dataset; segment_size is cfg.segment_size.
+    void update_with_segment(uint64_t group_id, double val, size_t row_idx, size_t segment_size) {
+        size_t p = partition_of(group_id);
+        CAPartition& part = partitions_[p];
+        part.total_sum += val;
+        if (val > part.max_value) part.max_value = val;
+        if (val < part.min_value) part.min_value = val;
+        part.count++;
+        part.fm.update(group_id);
+        if (segment_size > 0) {
+            const size_t seg = row_idx / segment_size;
+            if (seg >= part.segment_sketches.size()) {
+                part.segment_sketches.resize(seg + 1);
+                part.segment_counts.resize(seg + 1, 0);
+            }
+            part.segment_sketches[seg].update(group_id);
+            part.segment_counts[seg]++;
+        }
     }
 
     // Prune partitions whose UB for the given aggregate < topKBound.

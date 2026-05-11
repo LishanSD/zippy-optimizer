@@ -66,4 +66,10 @@ RunMetrics run_zippy_ext_b(
     std::vector<std::pair<uint64_t,double>>& out_results,
     std::vector<uint64_t>& out_fa_groups);
 
-// Phase 7: RunMetrics run_zippy_ext_ab(...)
+// Extension A+B combined: stratified sampling (A) + measure-index injection (B).
+RunMetrics run_zippy_ext_ab(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);

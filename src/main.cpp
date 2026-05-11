@@ -97,16 +97,18 @@ int main(int argc, char* argv[]) {
     } else if (mode == "ext-b") {
         metrics = run_zippy_ext_b(dataset, k, cfg, results, fa_groups);
     } else if (mode == "ext-ab") {
-        fprintf(stderr, "ERROR: ext-ab mode not yet implemented (Phase 7)\n");
-        return 1;
+        metrics = run_zippy_ext_ab(dataset, k, cfg, results, fa_groups);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode.c_str());
         return 1;
     }
 
     // 4. Write output JSON (reached only when a mode is implemented)
+    const size_t n_groups_est = (mode == "brute-force")
+        ? results.size()                  // exact cardinality after full scan
+        : metrics.fa_candidates_count;    // lower-bound from sample
     write_output_json(output_path, mode, k, n_rows,
-                      /* n_groups estimate */ 0,
+                      n_groups_est,
                       results, metrics, fa_groups, cfg.output_fa_groups);
 
     if (cfg.verbose) {
