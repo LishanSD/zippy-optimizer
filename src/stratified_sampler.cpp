@@ -24,6 +24,7 @@
 #include <cmath>
 #include <limits>
 #include <random>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -123,18 +124,19 @@ inline void accumulate(SampleGroupStats& stats, double val) {
 }  // namespace
 
 SampleResult stratified_sample_and_select(
-    const std::vector<Row>&     dataset,
-    const GroupOccurrenceIndex& group_index,
-    size_t                      fa_capacity,
-    int                         k,
-    AggFunc                     agg_func,
-    double                      sample_frac,
-    double                      delta,
-    double                      alpha_ci,
-    double                      beta_ci,
-    double                      underrep_threshold,
-    size_t                      boost_rows,
-    uint64_t                    seed)
+    const std::vector<Row>&                   dataset,
+    const GroupOccurrenceIndex&               group_index,
+    size_t                                    fa_capacity,
+    int                                       k,
+    AggFunc                                   agg_func,
+    double                                    sample_frac,
+    double                                    delta,
+    double                                    alpha_ci,
+    double                                    beta_ci,
+    double                                    underrep_threshold,
+    size_t                                    boost_rows,
+    uint64_t                                  seed,
+    const std::unordered_set<uint64_t>&       pre_injected_groups)
 {
     SampleResult result;
 
@@ -142,6 +144,17 @@ SampleResult stratified_sample_and_select(
         result.is_optimizable = false;
         return result;
     }
+
+    // ── Extension AB: pre-inject forced groups (Extension B) first ───────────
+    // These occupy FA slots before stratified sampling can select candidates.
+    // We track them so they are excluded from the heavy-hitter top-up below.
+    for (uint64_t gid : pre_injected_groups) {
+        if (result.fa_groups.size() >= fa_capacity) break;
+        result.fa_groups.insert(gid);
+    }
+    // Remaining FA capacity after forced injection.
+    const size_t remaining_capacity = (fa_capacity > result.fa_groups.size())
+        ? fa_capacity - result.fa_groups.size() : 0;
 
     const size_t n_rows      = dataset.size();
     const double safe_delta  = (delta > 0.0) ? delta : 0.05;
@@ -253,16 +266,31 @@ SampleResult stratified_sample_and_select(
     }
     result.l_k_lower_bound = l_k;
 
-    // tempGroups = {g : LB(g) ≥ L_k}
+    // tempGroups = {g : LB(g) >= L_k}, excluding already-injected groups
     std::vector<Candidate> temp_groups;
     temp_groups.reserve(candidates.size());
     for (const auto& c : candidates) {
+        if (result.fa_groups.count(c.group_id)) continue;  // already injected
         if (c.lb >= l_k) temp_groups.push_back(c);
     }
     result.cs_above_lk = temp_groups.size();
 
-    // Algorithm 2 line 19: if C_s > C_f, the skew is insufficient — fall back.
-    if (temp_groups.size() > fa_capacity) {
+    // Algorithm 2 line 19: if C_s > remaining FA capacity, the skew is insufficient
+    // (checked against remaining_capacity so pre-injected groups are not counted).
+    if (remaining_capacity == 0 || temp_groups.size() > remaining_capacity) {
+        // If FA is completely consumed by forced groups, still mark as optimizable
+        // (those forced groups will drive pruning). Only fall back if the
+        // remaining sample-derived candidates also overflow the remaining space.
+        if (remaining_capacity == 0) {
+            // Nothing left for stratified candidates — forced groups fill FA.
+            // Still optimizable if we had at least some groups pre-injected.
+            if (result.fa_groups.empty()) {
+                result.is_optimizable = false;
+                return result;
+            }
+            // else: fa_groups already set; skip to return.
+            return result;
+        }
         result.is_optimizable = false;
         return result;
     }
@@ -294,7 +322,7 @@ SampleResult stratified_sample_and_select(
         }
     }
 
-    // FAgroups = tempGroups
+    // FAgroups += tempGroups (pre-injected groups were already inserted above)
     for (const auto& c : temp_groups) result.fa_groups.insert(c.group_id);
 
     // Heavy-hitter top-up: fill remaining FA slots with highest-count groups
@@ -309,7 +337,7 @@ SampleResult stratified_sample_and_select(
                   });
         for (const auto& c : sorted_by_count) {
             if (result.fa_groups.size() >= fa_capacity) break;
-            result.fa_groups.insert(c.group_id);
+            result.fa_groups.insert(c.group_id);  // insert is a no-op if already present
         }
     }
 
