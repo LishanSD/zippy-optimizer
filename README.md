@@ -186,12 +186,12 @@ This section uses three datasets of increasing difficulty to show the concrete i
 
 ### Dataset Overview
 
-| Dataset | Rows | Groups | Zipf α | Rare groups | Purpose |
-|---------|------|--------|--------|-------------|---------|
-| **S0** | ~10K | 500 | 1.2 | 10% (few rows, 100× value) | Quick correctness check |
-| **S1** | 10M | 1M | 1.2 | None | Shows Zippy speed vs brute-force |
-| **S2** | ~11M | 10M | 1.0 | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes |
-| **monster_adv** | 100M | 10M | 1.1 | 100 rare groups, 1 row each, 1,000,000× value | Extreme "needle in a haystack" outliers to demonstrate Extension B |
+| Dataset         | Rows | Groups | Zipf α | Rare groups                                         | Purpose                                                            |
+| --------------- | ---- | ------ | ------ | --------------------------------------------------- | ------------------------------------------------------------------ |
+| **S0**          | ~10K | 500    | 1.2    | 10% (few rows, 100× value)                          | Quick correctness check                                            |
+| **S1**          | 10M  | 1M     | 1.2    | None                                                | Shows Zippy speed vs brute-force                                   |
+| **S2**          | ~11M | 10M    | 1.0    | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes      |
+| **monster_adv** | 100M | 10M    | 1.1    | 100 rare groups, 1 row each, 1,000,000× value       | Extreme "needle in a haystack" outliers to demonstrate Extension B |
 
 ### Step 1 — Build
 
@@ -251,11 +251,11 @@ All five should produce the same top-10 group IDs.
 
 **What to look for in the metrics JSON:**
 
-| Metric | Brute-force | Baseline (expected) |
-|--------|-------------|---------------------|
-| `total_duration_ms` | ~1500 ms (Cache miss penalty) | **~400 ms** (3–4× faster) |
-| `partitions_pruned_pct` | — | **> 90%** |
-| `total_passes` | — | **1–2** |
+| Metric                  | Brute-force                   | Baseline (expected)       |
+| ----------------------- | ----------------------------- | ------------------------- |
+| `total_duration_ms`     | ~1500 ms (Cache miss penalty) | **~400 ms** (3–4× faster) |
+| `partitions_pruned_pct` | —                             | **> 90%**                 |
+| `total_passes`          | —                             | **1–2**                   |
 
 On S1 (no rare groups), baseline and ext-a should produce nearly identical results — the index build overhead is the only difference.
 
@@ -277,14 +277,14 @@ On S1 (no rare groups), baseline and ext-a should produce nearly identical resul
 
 **What to look for:**
 
-| Metric | Brute-force | Baseline (expected) | ext-a (expected) |
-|--------|-------------|---------------------|------------------|
-| `total_duration_ms` | ~1300 ms | ~1050 ms | ~1800 ms including index build |
-| `topKBound_after_pass1` | — | ~7.7B | ~9.9B |
-| `partitions_pruned_pct` | — | ~90% | ~100% |
-| `total_passes` | — | 3 passes | 1 pass |
-| `pass2plus_duration_ms` | — | ~700 ms | ~0 ms |
-| `index_build_duration_ms` | 0.0 ms | 0.0 ms | ~1300 ms one-shot overhead |
+| Metric                    | Brute-force | Baseline (expected) | ext-a (expected)               |
+| ------------------------- | ----------- | ------------------- | ------------------------------ |
+| `total_duration_ms`       | ~1300 ms    | ~1050 ms            | ~1800 ms including index build |
+| `topKBound_after_pass1`   | —           | ~7.7B               | ~9.9B                          |
+| `partitions_pruned_pct`   | —           | ~90%                | ~100%                          |
+| `total_passes`            | —           | 3 passes            | 1 pass                         |
+| `pass2plus_duration_ms`   | —           | ~700 ms             | ~0 ms                          |
+| `index_build_duration_ms` | 0.0 ms      | 0.0 ms              | ~1300 ms one-shot overhead     |
 
 ### Step 6 — Extension B impact on monster_adv (extreme values)
 
@@ -319,6 +319,9 @@ Use `python/run_all_modes.py` when you want a single command that:
    - runtime ordering across modes
 
 ### Basic command
+
+Required runner flags: `--input`, `--k`, and `--output`.
+Optional runner flags: `--agg` (defaults to `sum`).
 
 ```bash
 python python/run_all_modes.py --input data/S2.bin --k 50 --agg sum --output results/S2_all_modes_sum.json
@@ -356,8 +359,8 @@ The generated file contains:
 
 - `build`: compiler + build command used
 - `query`: dataset path, row count, `k`, aggregate, and forwarded Zippy args
-- `modes`: the full per-mode JSON output that `zippy` would normally write
 - `comparisons`: exact-result checks vs `brute-force`, aggregate-multiset checks, and duration rankings
+- `modes`: the full per-mode JSON output that `zippy` would normally write
 
 This makes it easy to archive one file per experiment instead of managing five separate mode outputs by hand.
 
@@ -440,6 +443,7 @@ g++ -std=c++17 -O2 -o build/test_phase5 src/test_phase5.cpp src/zippy.cpp src/sa
 ```
 
 Expected output: `5 / 5 tests passed`. Verifies:
+
 - GroupOccurrenceIndex builds correctly (group counts, total rows)
 - Underrepresentation check logic
 - Stratified sampler returns valid FA candidates
@@ -476,12 +480,14 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 ```
 
 **Required:**
+
 - `--input <path>`: Path to binary dataset file
 - `--n-rows <int>`: Number of rows in dataset
 - `--k <int>`: Number of top results to return
 - `--output <path>`: Path to write JSON results file
 
 **Algorithm selection:**
+
 - `--mode <string>`: The algorithm execution mode to use. One of:
   - `brute-force`: Exact hash aggregation over the entire dataset. Ground truth reference.
   - `baseline`: Standard Zippy algorithm (Phase 4C).
@@ -491,6 +497,7 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 - `--agg <string>`: The aggregation function to use. One of: `sum`, `count`, `max`, `min`. (default: `sum`)
 
 **Zippy tuning parameters:**
+
 - `--fa-capacity <int>`: FA hash table capacity (Cf). Must be able to fit in L1/L2 cache. (default: `50000`)
 - `--n-partitions <int>`: Number of CA partitions (Cc). (default: `10000`)
 - `--sample-frac <float>`: Uniform random sampling fraction. (default: `0.01`)
@@ -501,13 +508,16 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 - `--segment-size <int>`: Rows per locality segment for the locality check. (default: `100000`)
 
 **Extension A parameters:**
+
 - `--underrep-threshold <float>`: Threshold for determining if a rare group is underrepresented. (default: `0.5`)
 - `--boost-rows <int>`: Number of rows to artificially sample for each boosted rare group. (default: `10`)
 
 **Extension B parameters:**
+
 - `--measure-m <int>`: Number of extreme-value rows to track in the min-heap. (default: `500`)
 
 **Output options:**
+
 - `--verbose`: Print per-pass statistics to stderr.
 - `--output-fa-groups`: Include the final FA group IDs in the JSON output.
 
@@ -518,17 +528,20 @@ python python/generate_data.py [OPTIONS]
 ```
 
 **Required:**
+
 - `--output <path>`: Path to write the binary output dataset.
 - `--n-rows <int>`: Number of base rows to generate.
 - `--n-groups <int>`: Number of unique groups in the base Zipf distribution.
 
 **Distribution parameters:**
+
 - `--zipf-alpha <float>`: Zipf skew parameter. Higher values mean more skew. Must be > 0. (default: `1.2`)
 - `--value-distribution <string>`: Distribution of the values. One of: `exponential`, `uniform`, `constant`. (default: `exponential`)
 - `--value-scale <float>`: Mean/scale multiplier for the value distribution. (default: `100.0`)
 - `--seed <int>`: Random seed for reproducibility. (default: `42`)
 
 **Rare/Adversarial group injection:**
+
 - `--rare-group-fraction <float>`: Fraction of `n-groups` to create as rare high-value groups (adversarial pattern). 0.0 means none. (default: `0.0`)
 - `--rare-group-rows <int>`: Maximum number of rows per rare group. (default: `3`)
 - `--rare-group-value-multiplier <float>`: Multiplier applied to `value-scale` for rare group values. (default: `100.0`)

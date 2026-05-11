@@ -126,12 +126,11 @@ def summarize_comparisons(reports: Dict[str, dict]) -> dict:
 
     per_mode = {}
     ordered = []
-    for mode, report in reports.items():
+    for mode in MODES:
+        report = reports[mode]
         metrics = report["metrics"]
         total_ms = float(metrics.get("total_duration_ms", 0.0))
         ordered.append((mode, total_ms))
-        if mode == "brute-force":
-            continue
 
         per_mode[mode] = {
             "matches_exact_top_k_results": exact_pairs(report) == exact_pairs(brute),
@@ -145,17 +144,21 @@ def summarize_comparisons(reports: Dict[str, dict]) -> dict:
             "total_passes": metrics.get("total_passes"),
         }
 
-    ordered.sort(key=lambda item: item[1])
-    non_bf = [item for item in ordered if item[0] != "brute-force"]
+    sorted_by_duration = sorted(ordered, key=lambda item: item[1])
+    non_bf = [item for item in sorted_by_duration if item[0] != "brute-force"]
 
     return {
         "reference_mode": "brute-force",
         "per_mode": per_mode,
-        "fastest_mode_overall": ordered[0][0] if ordered else None,
+        "fastest_mode_overall": sorted_by_duration[0][0] if sorted_by_duration else None,
         "fastest_mode_non_bruteforce": non_bf[0][0] if non_bf else None,
         "modes_by_total_duration_ms": [
             {"mode": mode, "total_duration_ms": total_ms}
             for mode, total_ms in ordered
+        ],
+        "modes_ranked_by_total_duration_ms": [
+            {"mode": mode, "total_duration_ms": total_ms}
+            for mode, total_ms in sorted_by_duration
         ],
     }
 
@@ -249,8 +252,8 @@ def main() -> int:
             "agg": args.agg,
             "extra_zippy_args": extra_args,
         },
-        "modes": reports,
         "comparisons": comparisons,
+        "modes": reports,
         "commands": commands,
     }
 
