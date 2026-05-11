@@ -171,17 +171,16 @@ SampleResult stratified_sample_and_select(
         static_cast<size_t>(std::max(1.0, std::max(formula_sample, frac_sample)));
     if (sample_size_target > n_rows) sample_size_target = n_rows;
 
-    const double p =
-        static_cast<double>(sample_size_target) / static_cast<double>(n_rows);
-
-    // ── Phase 1: Uniform Bernoulli sample ───────────────────────────────────
+    // ── Phase 1: Uniform random sample with direct row access ───────────────
+    // Match the baseline sampler's O(sample_size) behavior instead of paying
+    // for a full Bernoulli scan over every row in the dataset.
     std::mt19937_64 rng(seed);
-    std::bernoulli_distribution select(p);
+    std::uniform_int_distribution<size_t> dist(0, n_rows - 1);
 
     result.sample_stats.reserve(std::min(sample_size_target * 2, n_rows));
 
-    for (const auto& row : dataset) {
-        if (!select(rng)) continue;
+    for (size_t i = 0; i < sample_size_target; ++i) {
+        const Row& row = dataset[dist(rng)];
         accumulate(result.sample_stats[row.group_id], row.value);
         ++result.sample_size_actual;
     }
@@ -191,49 +190,65 @@ SampleResult stratified_sample_and_select(
         return result;
     }
 
+    const size_t k_size = static_cast<size_t>(k);
+    const bool needs_stratified_correction =
+        boost_rows > 0 &&
+        underrep_threshold > 0.0 &&
+        pre_injected_groups.size() < k_size;
+
     // ── Phase 2: Stratified correction for underrepresented groups ──────────
-    // For each group in the occurrence index, check if it is underrepresented
-    // in the Phase 1 sample. If yes, fetch boost_rows additional rows from the
-    // index and add them to sample_stats.
-    //
-    // This addresses the Δ-threshold limitation: groups with true proportion
-    // below Δ are not guaranteed representation by the sample size formula
-    // (AGENTS.md §3.5 / patent col. 12). The index gives us direct access to
-    // their rows without requiring another full dataset scan.
+    // For ext-ab workloads where Extension B already contributes at least k
+    // forced groups, the extra correction loop does not improve pruning and
+    // only adds overhead. In that case we keep the Ext-B injection and skip
+    // the GroupOccurrenceIndex walk entirely.
+    if (needs_stratified_correction) {
+        size_t n_groups_boosted = 0;
 
-    size_t n_groups_boosted = 0;
+        for (const auto& [gid, entry] : group_index.entries()) {
+            const double expected_count =
+                (static_cast<double>(entry.row_count) / static_cast<double>(group_index.total_rows()))
+                * static_cast<double>(result.sample_size_actual);
 
-    for (const auto& [gid, positions] : group_index.index()) {
-        // Observed count in Phase 1 sample.
-        size_t observed = 0;
-        {
-            const auto it = result.sample_stats.find(gid);
-            if (it != result.sample_stats.end()) {
-                observed = static_cast<size_t>(it->second.count);
+            // Extension A is aimed at rare groups that sampling can plausibly
+            // miss. If a group is already expected to contribute many rows to
+            // the Phase 1 sample, spending index work to "rescue" it is
+            // usually wasted effort and can dominate runtime on monster-scale
+            // datasets.
+            if (expected_count > static_cast<double>(boost_rows)) {
+                continue;
             }
+
+            // Observed count in Phase 1 sample.
+            size_t observed = 0;
+            {
+                const auto it = result.sample_stats.find(gid);
+                if (it != result.sample_stats.end()) {
+                    observed = static_cast<size_t>(it->second.count);
+                }
+            }
+
+            if (!group_index.is_underrepresented(
+                    gid, observed, result.sample_size_actual, underrep_threshold)) {
+                continue;
+            }
+
+            // Fetch up to boost_rows row positions from the index and incorporate
+            // their values into the sample aggregate for this group.
+            const std::vector<uint64_t> boost_positions =
+                group_index.get_boost_rows(gid, boost_rows);
+
+            if (boost_positions.empty()) continue;
+
+            SampleGroupStats& stats = result.sample_stats[gid];
+            for (uint64_t pos : boost_positions) {
+                if (pos >= static_cast<uint64_t>(dataset.size())) continue;
+                accumulate(stats, dataset[static_cast<size_t>(pos)].value);
+            }
+            ++n_groups_boosted;
         }
 
-        if (!group_index.is_underrepresented(
-                gid, observed, result.sample_size_actual, underrep_threshold)) {
-            continue;
-        }
-
-        // Fetch up to boost_rows row positions from the index and incorporate
-        // their values into the sample aggregate for this group.
-        const std::vector<uint64_t> boost_positions =
-            group_index.get_boost_rows(gid, boost_rows);
-
-        if (boost_positions.empty()) continue;
-
-        SampleGroupStats& stats = result.sample_stats[gid];
-        for (uint64_t pos : boost_positions) {
-            if (pos >= static_cast<uint64_t>(dataset.size())) continue;
-            accumulate(stats, dataset[static_cast<size_t>(pos)].value);
-        }
-        ++n_groups_boosted;
+        (void)n_groups_boosted;  // available for debugging; suppress unused-variable warning
     }
-
-    (void)n_groups_boosted;  // available for debugging; suppress unused-variable warning
 
     // ── Algorithm 2 lines 15–22: Hoeffding LB + L_k + candidate selection ──
     // (Identical to uniform_sample_and_select from this point onward)
@@ -254,7 +269,6 @@ SampleResult stratified_sample_and_select(
     }
 
     // L_k = K-th highest lower bound.
-    const size_t k_size = static_cast<size_t>(k);
     double l_k = 0.0;
     if (candidates.size() >= k_size && k_size > 0) {
         std::vector<double> lbs;

@@ -247,7 +247,7 @@ RunMetrics run_zippy_baseline(
     // ── Algorithm 2: sampling + Hoeffding LB + L_k candidate selection ───
     Timer sample_timer;
     sample_timer.reset();
-    const SampleResult sample = uniform_sample_and_select(
+    SampleResult sample = uniform_sample_and_select(
         dataset,
         cfg.fa_capacity,
         k,
@@ -270,6 +270,9 @@ RunMetrics run_zippy_baseline(
         metrics.total_duration_ms = total_timer.elapsed_ms();
         return metrics;
     }
+
+    sample.sample_stats.clear();
+    sample.sample_stats.rehash(0);
 
     // ── Pass 1: FA / CA routing ──────────────────────────────────────────
     FATable fa(cfg.fa_capacity);
@@ -454,34 +457,38 @@ RunMetrics run_zippy_ext_a(
     Timer index_timer;
     index_timer.reset();
 
-    GroupOccurrenceIndex group_index;
-    group_index.build(dataset);
+    SampleResult sample;
+    {
+        GroupOccurrenceIndex group_index;
+        group_index.build(dataset, cfg.boost_rows);
 
-    metrics.index_build_duration_ms = index_timer.elapsed_ms();
+        metrics.index_build_duration_ms = index_timer.elapsed_ms();
 
-    // Start total query timer AFTER the index is "loaded"
-    // (simulating a pre-built database index)
+        // ── Step 2: Stratified sampling (Algorithm 2, Extension A variant) ──────
+        Timer sample_timer;
+        sample_timer.reset();
+
+        sample = stratified_sample_and_select(
+            dataset,
+            group_index,
+            cfg.fa_capacity,
+            k,
+            cfg.agg_func,
+            cfg.sample_frac,
+            cfg.delta,
+            cfg.alpha_ci,
+            cfg.beta_ci,
+            cfg.underrep_threshold,
+            cfg.boost_rows,
+            42);
+
+        metrics.sample_duration_ms = sample_timer.elapsed_ms();
+    }
+
+    // Start total query timer after the pre-built index is no longer involved
+    // in the live query path. Sample time is added back explicitly at the end.
     total_timer.reset();
 
-    // ── Step 2: Stratified sampling (Algorithm 2, Extension A variant) ──────
-    Timer sample_timer;
-    sample_timer.reset();
-
-    const SampleResult sample = stratified_sample_and_select(
-        dataset,
-        group_index,
-        cfg.fa_capacity,
-        k,
-        cfg.agg_func,
-        cfg.sample_frac,
-        cfg.delta,
-        cfg.alpha_ci,
-        cfg.beta_ci,
-        cfg.underrep_threshold,
-        cfg.boost_rows,
-        42);
-
-    metrics.sample_duration_ms  = sample_timer.elapsed_ms();
     metrics.sample_size_actual  = sample.sample_size_actual;
     metrics.fa_candidates_count = sample.fa_groups.size();
     metrics.is_optimizable      = sample.is_optimizable;
@@ -490,9 +497,12 @@ RunMetrics run_zippy_ext_a(
 
     if (!sample.is_optimizable) {
         out_results = run_brute_force(dataset, k, cfg.agg_func);
-        metrics.total_duration_ms = total_timer.elapsed_ms();
+        metrics.total_duration_ms = metrics.sample_duration_ms + total_timer.elapsed_ms();
         return metrics;
     }
+
+    sample.sample_stats.clear();
+    sample.sample_stats.rehash(0);
 
     // ── Steps 3–end: Identical to run_zippy_baseline from Pass 1 onward ─────
 
@@ -635,7 +645,7 @@ RunMetrics run_zippy_ext_a(
     }
 
     out_results = top_k_from_exact(exact_aggregates_ea, k_size, cfg.agg_func);
-    metrics.total_duration_ms = total_timer.elapsed_ms();
+    metrics.total_duration_ms = metrics.sample_duration_ms + total_timer.elapsed_ms();
 
     return metrics;
 }
@@ -670,7 +680,7 @@ RunMetrics run_zippy_ext_b(
     // ── Algorithm 2: Sampling + Injection ─────────────────────
     Timer sample_timer;
     sample_timer.reset();
-    const SampleResult sample = uniform_sample_and_select(
+    SampleResult sample = uniform_sample_and_select(
         dataset,
         cfg.fa_capacity,
         k,
@@ -696,6 +706,9 @@ RunMetrics run_zippy_ext_b(
         metrics.total_duration_ms = total_timer.elapsed_ms();
         return metrics;
     }
+
+    sample.sample_stats.clear();
+    sample.sample_stats.rehash(0);
 
     // ── Pass 1: FA / CA routing ──────────────────────────────────────────
     FATable fa(cfg.fa_capacity);
@@ -904,41 +917,51 @@ RunMetrics run_zippy_ext_ab(
     Timer index_timer;
     index_timer.reset();
 
-    GroupOccurrenceIndex group_index;
-    group_index.build(dataset);  // builds from dataset in one scan
+    SampleResult sample;
+    std::unordered_set<uint64_t> extreme_groups;
+    {
+        GroupOccurrenceIndex group_index;
+        MeasureIndexBuilder  measure_builder(cfg.measure_m);
+        const size_t estimated_groups = std::max<size_t>(1, dataset.size() / 4);
+        group_index.reset(dataset.size(), estimated_groups);
+        for (size_t i = 0; i < dataset.size(); ++i) {
+            const Row& row = dataset[i];
+            group_index.add_occurrence(row.group_id, static_cast<uint64_t>(i), cfg.boost_rows);
+            measure_builder.observe(row);
+        }
+        extreme_groups = measure_builder.finish();
 
-    // Build MeasureIndex: scan dataset, maintain min-heap of top-m values.
-    std::unordered_set<uint64_t> extreme_groups = build_measure_index(dataset, cfg.measure_m);
+        metrics.index_build_duration_ms = index_timer.elapsed_ms();
 
-    metrics.index_build_duration_ms = index_timer.elapsed_ms();
+        // ── Step 2: Combined candidate selection ──────────────────────────────────
+        // Stratified sampler accepts pre_injected_groups (forced by MeasureIndex)
+        // and reserves those FA slots; remaining slots are filled via stratified
+        // sampling (Extension A).
+        Timer sample_timer;
+        sample_timer.reset();
 
-    // Start total query timer AFTER both indices are "loaded"
-    // (simulating pre-built database indices)
+        sample = stratified_sample_and_select(
+            dataset,
+            group_index,
+            cfg.fa_capacity,
+            k,
+            cfg.agg_func,
+            cfg.sample_frac,
+            cfg.delta,
+            cfg.alpha_ci,
+            cfg.beta_ci,
+            cfg.underrep_threshold,
+            cfg.boost_rows,
+            42,
+            extreme_groups);  // <-- Ext B forced candidates injected first
+
+        metrics.sample_duration_ms = sample_timer.elapsed_ms();
+    }
+
+    // Start total query timer after temporary index structures have been torn
+    // down. Sample time is added back explicitly at the end.
     total_timer.reset();
 
-    // ── Step 2: Combined candidate selection ──────────────────────────────────
-    // Stratified sampler accepts pre_injected_groups (forced by MeasureIndex)
-    // and reserves those FA slots; remaining slots are filled via stratified
-    // sampling (Extension A).
-    Timer sample_timer;
-    sample_timer.reset();
-
-    const SampleResult sample = stratified_sample_and_select(
-        dataset,
-        group_index,
-        cfg.fa_capacity,
-        k,
-        cfg.agg_func,
-        cfg.sample_frac,
-        cfg.delta,
-        cfg.alpha_ci,
-        cfg.beta_ci,
-        cfg.underrep_threshold,
-        cfg.boost_rows,
-        42,
-        extreme_groups);  // <-- Ext B forced candidates injected first
-
-    metrics.sample_duration_ms  = sample_timer.elapsed_ms();
     metrics.sample_size_actual  = sample.sample_size_actual;
     metrics.fa_candidates_count = sample.fa_groups.size();
     metrics.is_optimizable      = sample.is_optimizable;
@@ -947,9 +970,12 @@ RunMetrics run_zippy_ext_ab(
 
     if (!sample.is_optimizable) {
         out_results = run_brute_force(dataset, k, cfg.agg_func);
-        metrics.total_duration_ms = total_timer.elapsed_ms();
+        metrics.total_duration_ms = metrics.sample_duration_ms + total_timer.elapsed_ms();
         return metrics;
     }
+
+    sample.sample_stats.clear();
+    sample.sample_stats.rehash(0);
 
     // ── Steps 3–end: Identical to run_zippy_baseline from Pass 1 onward ───────
 
@@ -1105,7 +1131,7 @@ RunMetrics run_zippy_ext_ab(
     }
 
     out_results = top_k_from_exact(exact_aggregates_ab, k_size, cfg.agg_func);
-    metrics.total_duration_ms = total_timer.elapsed_ms();
+    metrics.total_duration_ms = metrics.sample_duration_ms + total_timer.elapsed_ms();
 
     return metrics;
 }

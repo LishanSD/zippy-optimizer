@@ -8,8 +8,32 @@
 
 #include <algorithm>
 
-void GroupOccurrenceIndex::build(const std::vector<Row>& dataset) {
-    index_.clear();
+void GroupOccurrenceIndex::reset(size_t total_rows, size_t estimated_groups) {
+    entries_.clear();
+    if (estimated_groups > 0) {
+        entries_.reserve(estimated_groups);
+    }
+    total_rows_ = total_rows;
+}
+
+void GroupOccurrenceIndex::add_occurrence(
+    uint64_t group_id,
+    uint64_t row_position,
+    size_t   max_positions_per_group)
+{
+    auto [it, inserted] = entries_.try_emplace(group_id);
+    (void)inserted;
+    GroupOccurrenceEntry& entry = it->second;
+    ++entry.row_count;
+    if (entry.positions.size() < max_positions_per_group) {
+        entry.positions.push_back(row_position);
+    }
+}
+
+void GroupOccurrenceIndex::build(
+    const std::vector<Row>& dataset,
+    size_t max_positions_per_group)
+{
     total_rows_ = dataset.size();
 
     // Extension A is most useful on high-cardinality inputs, so under-reserving
@@ -18,10 +42,10 @@ void GroupOccurrenceIndex::build(const std::vector<Row>& dataset) {
     // estimate for the high-cardinality benchmark shape and avoids the memory
     // cost of reserving one bucket per row.
     const size_t estimated_groups = std::max<size_t>(1, total_rows_ / 4);
-    index_.reserve(estimated_groups);
+    reset(total_rows_, estimated_groups);
 
     for (size_t i = 0; i < dataset.size(); ++i) {
-        index_[dataset[i].group_id].push_back(static_cast<uint64_t>(i));
+        add_occurrence(dataset[i].group_id, static_cast<uint64_t>(i), max_positions_per_group);
     }
 }
 
@@ -33,10 +57,8 @@ bool GroupOccurrenceIndex::is_underrepresented(
 {
     if (total_rows_ == 0 || sample_size == 0 || threshold <= 0.0) return false;
 
-    const auto it = index_.find(group_id);
-    if (it == index_.end()) return false;
-
-    const size_t group_size = it->second.size();
+    const size_t group_size = row_count_for(group_id);
+    if (group_size == 0) return false;
 
     // expected_count = (group_size / total_rows) × sample_size
     const double expected =
@@ -54,15 +76,15 @@ bool GroupOccurrenceIndex::is_underrepresented(
 std::vector<uint64_t> GroupOccurrenceIndex::get_boost_rows(
     uint64_t group_id, size_t n_boost) const
 {
-    const auto it = index_.find(group_id);
-    if (it == index_.end()) return {};
+    const auto it = entries_.find(group_id);
+    if (it == entries_.end()) return {};
 
-    const auto& positions = it->second;
+    const auto& positions = it->second.positions;
     const size_t take = std::min(n_boost, positions.size());
     return std::vector<uint64_t>(positions.begin(), positions.begin() + take);
 }
 
 size_t GroupOccurrenceIndex::row_count_for(uint64_t group_id) const {
-    const auto it = index_.find(group_id);
-    return (it == index_.end()) ? 0 : it->second.size();
+    const auto it = entries_.find(group_id);
+    return (it == entries_.end()) ? 0 : it->second.row_count;
 }
