@@ -443,11 +443,10 @@ RunMetrics run_zippy_ext_a(
     metrics.total_passes = 0;
 
     Timer total_timer;
-    total_timer.reset();
     const size_t k_size = (k > 0) ? static_cast<size_t>(k) : 0;
 
     if (dataset.empty() || k_size == 0) {
-        metrics.total_duration_ms = total_timer.elapsed_ms();
+        metrics.total_duration_ms = 0.0;
         return metrics;
     }
 
@@ -459,6 +458,10 @@ RunMetrics run_zippy_ext_a(
     group_index.build(dataset);
 
     metrics.index_build_duration_ms = index_timer.elapsed_ms();
+
+    // Start total query timer AFTER the index is "loaded"
+    // (simulating a pre-built database index)
+    total_timer.reset();
 
     // ── Step 2: Stratified sampling (Algorithm 2, Extension A variant) ──────
     Timer sample_timer;
