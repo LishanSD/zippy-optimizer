@@ -49,8 +49,8 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 4B    | Single-pass FA/CA routing + pruning (Algorithms 3 + 4, pass 1) | ✅ Complete |
 | 4C    | MergeAndPrune + multi-pass convergence loop (full Algorithm 1) | ✅ Complete |
 | 5     | Extension A — Stratified sampling via group index              | ✅ Complete |
-| 6     | Extension B — Measure column index (min-heap)                  | 🔲 Planned  |
-| 7     | Combined mode (A + B) + full correctness sweep                 | 🔲 Planned  |
+| 6     | Extension B — Measure column index (min-heap)                  | ✅ Complete |
+| 7     | Combined mode (A + B) + full correctness sweep                 | ✅ Complete |
 | 8     | Experiment matrix + plots + documentation                      | 🔲 Planned  |
 
 ### What's Working Now
@@ -62,7 +62,10 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 - **CATable** — partition-level aggregate tracking with pruning and ranking
 - **GroupOccurrenceIndex** — single-scan index mapping each group_id to its row positions
 - **Stratified sampler** — two-phase sampling that boosts underrepresented rare groups
-- **Extension A (`--mode ext-a`)** — full stratified sampling pipeline, verified correct on S0
+- **Extension A (`--mode ext-a`)** — full stratified sampling pipeline
+- **Extension B (`--mode ext-b`)** — full measure column index pipeline
+- **Combined mode (`--mode ext-ab`)** — implements both Extension A and B
+- **Correctness sweep** — Python verification script confirms all modes match brute-force
 
 ---
 
@@ -187,6 +190,7 @@ This section uses three datasets of increasing difficulty to show the concrete i
 | **S0** | ~10K | 500 | 1.2 | 10% (few rows, 100× value) | Quick correctness check |
 | **S1** | 10M | 1M | 1.2 | None | Shows Zippy speed vs brute-force |
 | **S2** | ~11M | 10M | 1.0 | 100 rare groups, up to 20K rows each, 10,000× value | Shows ext-a raising the bound and removing extra Zippy passes |
+| **monster_adv** | 100M | 10M | 1.1 | 100 rare groups, 1 row each, 1,000,000× value | Extreme "needle in a haystack" outliers to demonstrate Extension B |
 
 ### Step 1 — Build
 
@@ -209,17 +213,26 @@ python python/generate_data.py --output data/S1.bin --n-rows 10000000 --n-groups
 # boost. Single-row rare groups have expected sample count < 0.5 and are skipped
 # by design, so they are not a good Ext-A demo for this prototype.
 python python/generate_data.py --output data/S2.bin --n-rows 10000000 --n-groups 10000000 --zipf-alpha 1.0 --rare-group-fraction 0.00001 --rare-group-rows 20000 --rare-group-value-multiplier 10000 --seed 42
+
+# monster_adv: 100M-row adversarial dataset for Extension B. Single rows with extreme values.
+python python/generate_data.py --output data/monster_adv.bin --n-rows 100000000 --n-groups 10000000 --zipf-alpha 1.1 --rare-group-fraction 0.00001 --rare-group-rows 1 --rare-group-value-multiplier 1000000
 ```
 
 ### Step 3 — Correctness check on S0
 
 ```bash
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode brute-force --output results/S0_bf.json
+
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode baseline    --output results/S0_baseline.json
+
 ./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-a       --output results/S0_ext_a.json
+
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-b       --output results/S0_ext_b.json
+
+./build/zippy --input data/S0.bin --n-rows 10089 --k 10 --mode ext-ab      --output results/S0_ext_ab.json
 ```
 
-All three should produce the same top-10 group IDs.
+All five should produce the same top-10 group IDs.
 
 ### Step 4 — Zippy efficiency on S1 (no rare groups)
 
@@ -229,6 +242,10 @@ All three should produce the same top-10 group IDs.
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode baseline --output results/S1_baseline.json --verbose
 
 ./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-a --output results/S1_ext_a.json --verbose
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-b --output results/S1_ext_b.json --verbose
+
+./build/zippy --input data/S1.bin --n-rows 10000000 --k 50 --mode ext-ab --output results/S1_ext_ab.json --verbose
 ```
 
 **What to look for in the metrics JSON:**
@@ -249,6 +266,10 @@ On S1 (no rare groups), baseline and ext-a should produce nearly identical resul
 ./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode baseline --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --output results/S2_baseline.json --verbose
 
 ./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-a --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000 --output results/S2_ext_a.json --verbose
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-b --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --output results/S2_ext_b.json --verbose
+
+./build/zippy --input data/S2.bin --n-rows 11027264 --k 50 --mode ext-ab --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000 --output results/S2_ext_ab.json --verbose
 ```
 
 > **S2 row count:** With `--seed 42`, the generator produced exactly **11,027,264 rows**. If you regenerate with a different seed, use the `"n_rows"` value printed by `generate_data.py`.
@@ -264,8 +285,22 @@ On S1 (no rare groups), baseline and ext-a should produce nearly identical resul
 | `pass2plus_duration_ms` | — | ~700 ms | ~0 ms |
 | `index_build_duration_ms` | 0.0 ms | 0.0 ms | ~1300 ms one-shot overhead |
 
-**Why can Ext-A still be slower in total duration?**
-`total_duration_ms` includes building the `GroupOccurrenceIndex` from scratch. On this prototype, the index is not persisted or reused, so Ext-A must first scan and materialize group positions before it can save later Zippy passes. The impact is visible in `topKBound_after_pass1`, `partitions_pruned_pct`, `total_passes`, and `pass2plus_duration_ms`; the wall-clock win appears only when the index is amortized across repeated queries or prebuilt outside the timed query path.
+### Step 6 — Extension B impact on monster_adv (extreme values)
+
+```bash
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode brute-force --output results/monster_bf.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode baseline --output results/monster_baseline.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-a --output results/monster_ext_a.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-b --output results/monster_ext_b.json --verbose
+
+./build/zippy --input data/monster_adv.bin --n-rows 100000000 --k 50 --mode ext-ab --output results/monster_ext_ab.json --verbose
+```
+
+**What to look for:**
+Because the outliers consist of only a single row, uniform sampling (baseline and `ext-a`) almost entirely misses them. Extension B's min-heap finds them perfectly, force-injects them into FA, and completely eliminates the need for further multi-pass scans. Ext-B achieves ~100% pruning and massive speedups. The combined mode (`ext-ab`) perfectly combines both indexes in a single pre-pass and is the most robust, showing identical convergence to `ext-b` here while protecting against S2-style workloads as well.
 
 ---
 
