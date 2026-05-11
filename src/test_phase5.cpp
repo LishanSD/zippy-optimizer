@@ -62,12 +62,12 @@ bool test_group_index(const std::vector<Row>& dataset) {
 
     // Row count for each group must sum to dataset.size().
     size_t total_check = 0;
-    for (const auto& [gid, positions] : idx.index()) {
-        if (idx.row_count_for(gid) != positions.size()) {
+    for (const auto& [gid, entry] : idx.entries()) {
+        if (idx.row_count_for(gid) != entry.row_count) {
             std::fprintf(stderr, "FAIL [group_index]: row_count_for mismatch\n");
             return false;
         }
-        total_check += positions.size();
+        total_check += entry.row_count;
     }
     if (total_check != dataset.size()) {
         std::fprintf(stderr, "FAIL [group_index]: position sum %zu != %zu\n",

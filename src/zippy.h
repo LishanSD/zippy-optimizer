@@ -3,7 +3,8 @@
 //
 // Phase 4C: brute-force + baseline (sampling + pass1 pruning + multi-pass) implemented.
 // Phase 5:  Extension A (stratified sampling via GroupOccurrenceIndex) implemented.
-// Subsequent phases will add ext-b, ext-ab.
+// Phase 6:  Extension B (measure column index) implemented.
+// Phase 7:  Combined extension (ext-ab) implemented.
 
 #include "data_structures.h"
 #include "utils.h"
@@ -57,8 +58,8 @@ RunMetrics run_zippy_ext_a(
     std::vector<std::pair<uint64_t,double>>& out_results,
     std::vector<uint64_t>& out_fa_groups);
 
-// ── Future phases will add these declarations ──────────────────────────────
-
+// Extension B (Phase 6): measure column index — finds extreme-value rows via
+// a min-heap pre-pass and force-injects their group IDs into FA before sampling.
 RunMetrics run_zippy_ext_b(
     const std::vector<Row>& dataset,
     int k,
@@ -66,4 +67,12 @@ RunMetrics run_zippy_ext_b(
     std::vector<std::pair<uint64_t,double>>& out_results,
     std::vector<uint64_t>& out_fa_groups);
 
-// Phase 7: RunMetrics run_zippy_ext_ab(...)
+// Combined Extensions A + B (Phase 7): builds both indices in one shared
+// pre-pass, then force-injects extreme-value groups (Ext B) first and fills
+// remaining FA slots via stratified sampling (Ext A).
+RunMetrics run_zippy_ext_ab(
+    const std::vector<Row>& dataset,
+    int k,
+    const ZippyConfig& cfg,
+    std::vector<std::pair<uint64_t,double>>& out_results,
+    std::vector<uint64_t>& out_fa_groups);

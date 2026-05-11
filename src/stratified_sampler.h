@@ -3,6 +3,10 @@
 //
 // Algorithm (AGENTS.md §4 "Extension A"):
 //
+// Also used by Extension AB (combined): when pre_injected_groups is non-empty,
+// those groups are inserted into FA first (Extension B forced candidates), and
+// the remaining FA slots are filled via stratified sampling (Extension A).
+//
 //   Phase 1 (uniform):
 //     Bernoulli-sample dataset at fraction s1_fraction.
 //     Accumulate per-group {sum, count, min, max} → sample_stats.
@@ -44,15 +48,16 @@
 //   SampleResult with the same fields as uniform_sample_and_select(), plus
 //   sample_stats updated to include Phase 2 boost rows.
 SampleResult stratified_sample_and_select(
-    const std::vector<Row>&         dataset,
-    const GroupOccurrenceIndex&     group_index,
-    size_t                          fa_capacity,
-    int                             k,
-    AggFunc                         agg_func,
-    double                          sample_frac,
-    double                          delta,
-    double                          alpha_ci,
-    double                          beta_ci,
-    double                          underrep_threshold,
-    size_t                          boost_rows,
-    uint64_t                        seed = 42);
+    const std::vector<Row>&                   dataset,
+    const GroupOccurrenceIndex&               group_index,
+    size_t                                    fa_capacity,
+    int                                       k,
+    AggFunc                                   agg_func,
+    double                                    sample_frac,
+    double                                    delta,
+    double                                    alpha_ci,
+    double                                    beta_ci,
+    double                                    underrep_threshold,
+    size_t                                    boost_rows,
+    uint64_t                                  seed = 42,
+    const std::unordered_set<uint64_t>&       pre_injected_groups = {});

@@ -187,8 +187,8 @@ tie-breaking artifact, not a correctness bug — see `PAPER_AUDIT.md` "Caveats".
 | 4B | Pass 1 routing + pruning | ✅ done, union UB |
 | 4C | MergeAndPrune + multi-pass | ✅ done, multi-aggregate, with adaptive classification |
 | 5 | Extension A | ✅ done — GroupOccurrenceIndex + StratifiedSampler + `run_zippy_ext_a` wired, test gate passing |
-| 6 | Extension B | 🔲 not started |
-| 7 | Combined + correctness sweep | 🔲 not started |
+| 6 | Extension B | ✅ done — MeasureIndex + `run_zippy_ext_b` wired, test gate passing |
+| 7 | Combined + correctness sweep | ✅ done — `run_zippy_ext_ab` implemented, double-counting bug fixed, python verifier passing |
 | 8 | Experiment matrix + plots | 🔲 not started |
 
 The originally-planned "Phase 4C complete" has been *materially expanded*:

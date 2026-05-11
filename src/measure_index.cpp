@@ -1,33 +1,35 @@
 #include "measure_index.h"
-#include <queue>
+
+void MeasureIndexBuilder::observe(const Row& row) {
+    if (m_ == 0) return;
+
+    if (min_heap_.size() < m_) {
+        min_heap_.push({row.value, row.group_id});
+    } else if (row.value > min_heap_.top().first) {
+        min_heap_.pop();
+        min_heap_.push({row.value, row.group_id});
+    }
+}
+
+std::unordered_set<uint64_t> MeasureIndexBuilder::finish() {
+    std::unordered_set<uint64_t> extreme_groups;
+    extreme_groups.reserve(min_heap_.size());
+    while (!min_heap_.empty()) {
+        extreme_groups.insert(min_heap_.top().second);
+        min_heap_.pop();
+    }
+    return extreme_groups;
+}
 
 std::unordered_set<uint64_t> build_measure_index(
     const std::vector<Row>& dataset, 
     size_t m) 
 {
-    std::unordered_set<uint64_t> extreme_groups;
-    if (dataset.empty() || m == 0) return extreme_groups;
+    if (dataset.empty() || m == 0) return {};
 
-    // Min-heap: stores pairs of {row_value, group_id}
-    // top() will always be the SMALLEST of the top-m values we've seen so far.
-    using HeapItem = std::pair<double, uint64_t>;
-    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>> min_heap;
-
+    MeasureIndexBuilder builder(m);
     for (const auto& row : dataset) {
-        if (min_heap.size() < m) {
-            min_heap.push({row.value, row.group_id});
-        } else if (row.value > min_heap.top().first) {
-            min_heap.pop();
-            min_heap.push({row.value, row.group_id});
-        }
+        builder.observe(row);
     }
-
-    // Extract the unique group IDs from the top-m rows
-    extreme_groups.reserve(min_heap.size());
-    while (!min_heap.empty()) {
-        extreme_groups.insert(min_heap.top().second);
-        min_heap.pop();
-    }
-
-    return extreme_groups;
+    return builder.finish();
 }
