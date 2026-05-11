@@ -86,6 +86,7 @@ zippy-optimizer/
 │
 ├── python/                       Python orchestration layer
 │   ├── generate_data.py          Synthetic dataset generator (Zipf + rare groups)
+│   ├── run_all_modes.py          One-command build + 5-mode runner + combined report
 │   ├── run_experiments.py        Parameter sweeps, calls C++ binary (Phase 8)
 │   ├── plot_results.py           Matplotlib plots for results (Phase 8)
 │   ├── compare_phase4c_results.py Compare baseline vs brute-force outputs (Phase 4C)
@@ -304,8 +305,65 @@ Because the outliers consist of only a single row, uniform sampling (baseline an
 
 ---
 
+## 8. One-Command All-Modes Report
 
-## 8. Run Each Phase
+Use `python/run_all_modes.py` when you want a single command that:
+
+1. Builds `build/zippy(.exe)`
+2. Runs all five modes: `brute-force`, `baseline`, `ext-a`, `ext-b`, `ext-ab`
+3. Uses one dataset / one `k` / one aggregate function
+4. Infers `n_rows` automatically from the dataset file size unless you override it
+5. Writes one combined JSON report containing:
+   - each mode's normal output (`top_k_results` + `metrics`)
+   - correctness comparisons against `brute-force`
+   - runtime ordering across modes
+
+### Basic command
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --agg sum --output results/S2_all_modes_sum.json
+```
+
+`--agg` defaults to `sum`, so this is also valid:
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --output results/S2_all_modes_sum.json
+```
+
+### Passing Zippy tuning flags through
+
+Any extra arguments after the known runner flags are forwarded to every `zippy` invocation. For example:
+
+```bash
+python python/run_all_modes.py --input data/S2.bin --k 50 --agg sum --output results/S2_all_modes_tuned.json --fa-capacity 5000 --n-partitions 100 --sample-frac 0.0001 --underrep-threshold 1.0 --boost-rows 20000
+```
+
+### Useful options
+
+- `--n-rows <N>`: optional manual override if you do not want auto-detection
+- `--skip-build`: reuse the existing `build/zippy(.exe)` instead of rebuilding
+- `--compiler <name>`: choose a compiler other than `g++`
+- `--verbose`: pass `--verbose` through to each mode run
+- `--keep-mode-json`: keep the intermediate per-mode JSON files alongside the combined report
+
+### Windows note
+
+The commands above are written as single lines so they can be pasted directly into `cmd.exe` or PowerShell. The Unix-style trailing `\` line continuations are not valid in PowerShell.
+
+### Combined report structure
+
+The generated file contains:
+
+- `build`: compiler + build command used
+- `query`: dataset path, row count, `k`, aggregate, and forwarded Zippy args
+- `modes`: the full per-mode JSON output that `zippy` would normally write
+- `comparisons`: exact-result checks vs `brute-force`, aggregate-multiset checks, and duration rankings
+
+This makes it easy to archive one file per experiment instead of managing five separate mode outputs by hand.
+
+---
+
+## 9. Run Each Phase
 
 ### i. Build the C++ binary
 
@@ -411,7 +469,7 @@ Zippy supports `sum`, `count`, `max`, and `min` aggregations. You can specify th
 
 ---
 
-## 9. CLI Reference
+## 10. CLI Reference
 
 ```bash
 ./build/zippy [OPTIONS]
@@ -477,7 +535,7 @@ python python/generate_data.py [OPTIONS]
 
 ---
 
-## 10. Dataset Format
+## 11. Dataset Format
 
 Binary format, 16 bytes per row, little-endian, no header:
 
@@ -489,7 +547,7 @@ Total file size = `n_rows × 16` bytes.
 
 ---
 
-## 11. Output Format
+## 12. Output Format
 
 JSON with top-k results and performance metrics:
 
@@ -513,7 +571,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 12. Key Metrics
+## 13. Key Metrics
 
 | Metric                  | Description                                                |
 | ----------------------- | ---------------------------------------------------------- |
@@ -525,7 +583,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 13. How Zippy Works (Simplified)
+## 14. How Zippy Works (Simplified)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -547,7 +605,7 @@ JSON with top-k results and performance metrics:
 
 ---
 
-## 14. References
+## 15. References
 
 - **Paper:** Siddiqui et al., "Cache-Efficient Top-k Aggregation over High Cardinality Large Datasets", PVLDB 17(4), 2023. DOI: [10.14778/3636218.3636222](https://doi.org/10.14778/3636218.3636222)
 - **Patent:** US 12380098 / Application 20250103591 (implementation details)
