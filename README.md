@@ -51,7 +51,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 | 5     | Extension A — Stratified sampling via group index              | ✅ Complete |
 | 6     | Extension B — Measure column index (min-heap)                  | ✅ Complete |
 | 7     | Combined mode (A + B) + full correctness sweep                 | ✅ Complete |
-| 8     | Experiment matrix + plots + documentation                      | 🔲 Planned  |
+| 8     | Experiment matrix + plots + documentation                      | ✅ Complete |
 
 ### What's Working Now
 
@@ -66,6 +66,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 - **Extension B (`--mode ext-b`)** — full measure column index pipeline
 - **Combined mode (`--mode ext-ab`)** — implements both Extension A and B
 - **Correctness sweep** — Python verification script confirms all modes match brute-force
+- **Experiment automation + plotting (Phase 8)** — benchmark runners, result tables, and plots are implemented
 
 ---
 
@@ -75,7 +76,7 @@ The project follows an 8-phase implementation plan (see `AGENTS.md` §5.1).
 zippy-optimizer/
 ├── src/                          C++ core engine
 │   ├── main.cpp                  CLI entry point, argument parsing, data loading
-│   ├── zippy.h / zippy.cpp       Zippy algorithm (baseline implemented through Phase 4C)
+│   ├── zippy.h / zippy.cpp       Zippy algorithm (baseline + ext-a + ext-b + ext-ab)
 │   ├── data_structures.h         FATable, CATable, FMSketch, hash functions
 │   ├── sampler.h / sampler.cpp   Uniform random sampler (Phase 4)
 │   ├── group_index.h / .cpp      Extension A: GroupOccurrenceIndex (Phase 5)
@@ -87,8 +88,8 @@ zippy-optimizer/
 ├── python/                       Python orchestration layer
 │   ├── generate_data.py          Synthetic dataset generator (Zipf + rare groups)
 │   ├── run_all_modes.py          One-command build + 5-mode runner + combined report
-│   ├── run_experiments.py        Parameter sweeps, calls C++ binary (Phase 8)
-│   ├── plot_results.py           Matplotlib plots for results (Phase 8)
+│   ├── run_experiments.py        Parameter sweeps, calls C++ binary (Phase 8 complete)
+│   ├── plot_results.py           Matplotlib plots for results (Phase 8 complete)
 │   ├── compare_phase4c_results.py Compare baseline vs brute-force outputs (Phase 4C)
 │   ├── verify_correctness.py     Checks all modes match brute-force (Phase 7)
 │   └── verify_phase2.py          Cross-checks brute-force vs Python pandas
@@ -172,7 +173,7 @@ This is the most robust mode — it handles both rare-group and extreme-value ad
 
 - **C++ compiler:** GCC 10+ or Clang 12+ with C++17 support (MSVC also works)
 - **Python 3.8+** with `numpy` (for data generation and verification)
-- **Optional:** `matplotlib`, `pandas` (for experiment plotting in Phase 8)
+- **Optional:** `matplotlib`, `pandas` (for experiment execution, tables, and plotting)
 
 ```bash
 pip install numpy matplotlib pandas
