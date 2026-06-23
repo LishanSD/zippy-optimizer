@@ -284,20 +284,27 @@ static void run_multipass_loop(
 
         Timer pass_timer;
         pass_timer.reset();
-        for (const auto& row : dataset) {
-            if (fa.contains(row.group_id)) continue;
-            if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history))
-                continue;
+        {
+            constexpr size_t PREFETCH_DIST = 16;
+            const size_t n = dataset.size();
+            for (size_t i = 0; i < n; ++i) {
+                if (i + PREFETCH_DIST < n)
+                    fa.prefetch(dataset[i + PREFETCH_DIST].group_id);
+                const auto& row = dataset[i];
+                if (fa.contains(row.group_id)) continue;
+                if (!row_in_active_path(row.group_id, cfg.n_partitions, level - 1, active_history))
+                    continue;
 
-            const size_t parent_id = partition_id_for_level(row.group_id, cfg.n_partitions, level - 1);
-            const auto it = decisions.find(parent_id);
-            if (it == decisions.end()) continue;
+                const size_t parent_id = partition_id_for_level(row.group_id, cfg.n_partitions, level - 1);
+                const auto it = decisions.find(parent_id);
+                if (it == decisions.end()) continue;
 
-            if (it->second == PartitionDecision::EXACT) {
-                partial[row.group_id].update(row.value);
-            } else {
-                const size_t child_id = partition_id_for_level(row.group_id, cfg.n_partitions, level);
-                update_partition_from_row(children[child_id], row.group_id, row.value);
+                if (it->second == PartitionDecision::EXACT) {
+                    partial[row.group_id].update(row.value);
+                } else {
+                    const size_t child_id = partition_id_for_level(row.group_id, cfg.n_partitions, level);
+                    update_partition_from_row(children[child_id], row.group_id, row.value);
+                }
             }
         }
         metrics.pass2plus_duration_ms += pass_timer.elapsed_ms();
