@@ -80,17 +80,21 @@ double kth_highest_or_zero(std::vector<double>& values, size_t k) {
     return values[k - 1];
 }
 
+// active_history[lvl] is a vector<bool> of size n_partitions.
+// A true bit at index pid means that partition survived to that level.
+// Membership check is a single array index instead of a hash lookup,
+// and the bitset (10 000 partitions = 1 250 bytes) fits in L1 cache.
 bool row_in_active_path(
     uint64_t group_id,
     size_t n_partitions,
     int up_to_level,
-    const std::vector<std::unordered_set<size_t>>& active_history)
+    const std::vector<std::vector<bool>>& active_history)
 {
     for (int lvl = 1; lvl <= up_to_level; ++lvl) {
         if (lvl >= static_cast<int>(active_history.size())) return false;
         if (active_history[lvl].empty()) return false;
         const size_t pid = partition_id_for_level(group_id, n_partitions, lvl);
-        if (active_history[lvl].count(pid) == 0) return false;
+        if (!active_history[lvl][pid]) return false;
     }
     return true;
 }
