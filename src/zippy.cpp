@@ -408,7 +408,7 @@ RunMetrics run_zippy_baseline(
     std::vector<double> pass1_union;
     pass1_union.reserve(fa.size() + cfg.n_partitions);
     {
-        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        const auto fa_all = fa.all_aggregates(cfg.agg_func);
         for (const auto& [gid, val] : fa_all) {
             (void)gid;
             pass1_union.push_back(val);
@@ -565,7 +565,7 @@ RunMetrics run_zippy_ext_a(
     std::vector<double> pass1_union;
     pass1_union.reserve(fa.size() + cfg.n_partitions);
     {
-        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        const auto fa_all = fa.all_aggregates(cfg.agg_func);
         for (const auto& [gid, val] : fa_all) {
             (void)gid;
             pass1_union.push_back(val);
@@ -707,7 +707,7 @@ RunMetrics run_zippy_ext_b(
     std::vector<double> pass1_union;
     pass1_union.reserve(fa.size() + cfg.n_partitions);
     {
-        const auto fa_all = fa.top_k(fa.size(), cfg.agg_func);
+        const auto fa_all = fa.all_aggregates(cfg.agg_func);
         for (const auto& [gid, val] : fa_all) {
             (void)gid;
             pass1_union.push_back(val);
