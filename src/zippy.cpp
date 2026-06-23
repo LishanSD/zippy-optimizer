@@ -250,7 +250,7 @@ static void run_multipass_loop(
     const FATable&                                 fa,
     ExactAggregates&                               exact_aggregates,
     ChildPartitions&                               active_partitions,
-    std::vector<std::unordered_set<size_t>>&       active_history,
+    std::vector<std::vector<bool>>&                active_history,
     const ZippyConfig&                             cfg,
     size_t                                         k_size,
     RunMetrics&                                    metrics,
@@ -319,13 +319,13 @@ static void run_multipass_loop(
         if (done) break;
 
         active_partitions = merged.surviving_partitions;
-        if (static_cast<int>(active_history.size()) <= level) {
-            active_history.resize(level + 1);
+        while (static_cast<int>(active_history.size()) <= level) {
+            active_history.emplace_back(cfg.n_partitions, false);
         }
-        active_history[level].clear();
+        std::fill(active_history[level].begin(), active_history[level].end(), false);
         for (const auto& [pid, part] : active_partitions) {
             (void)part;
-            active_history[level].insert(pid);
+            active_history[level][pid] = true;
         }
         ++level;
     }
