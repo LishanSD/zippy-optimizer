@@ -39,6 +39,9 @@ struct RunMetrics {
     size_t partitions_exact_agg = 0;    // FM<CF or locality < α₀
     size_t partitions_logical   = 0;    // C_p/Q < T_c
     size_t partitions_physical  = 0;    // otherwise
+    // FA groups whose exact value already exceeds topKBound after Pass 1.
+    // If this equals k the multipass loop is a no-op (all top-k confirmed).
+    size_t topk_confirmed_pass1 = 0;
 };
 
 // ── JSON writer (no external library) ─────────────────────────────────────
@@ -95,7 +98,8 @@ inline void write_output_json(
     fprintf(f, "    \"cs_above_lk\": %zu,\n", m.cs_above_lk);
     fprintf(f, "    \"partitions_exact_agg\": %zu,\n", m.partitions_exact_agg);
     fprintf(f, "    \"partitions_logical\": %zu,\n", m.partitions_logical);
-    fprintf(f, "    \"partitions_physical\": %zu\n", m.partitions_physical);
+    fprintf(f, "    \"partitions_physical\": %zu,\n", m.partitions_physical);
+    fprintf(f, "    \"topk_confirmed_pass1\": %zu\n", m.topk_confirmed_pass1);
     fprintf(f, "  }\n}\n");
     fclose(f);
 }

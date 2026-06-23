@@ -436,6 +436,10 @@ RunMetrics run_zippy_baseline(
     metrics.topKBound_after_pass1 = topKBound;
     metrics.partitions_pruned_pct = ca.pruning_fraction();
     metrics.total_passes = 1;
+    for (const auto& [gid, val] : fa.all_aggregates(cfg.agg_func)) {
+        (void)gid;
+        if (val > topKBound) ++metrics.topk_confirmed_pass1;
+    }
 
     ExactAggregates exact_aggregates;
     exact_aggregates.reserve(std::max<size_t>(fa.size() * 2, 1));
@@ -596,6 +600,10 @@ RunMetrics run_zippy_ext_a(
     metrics.topKBound_after_pass1 = topKBound_ea;
     metrics.partitions_pruned_pct = ca.pruning_fraction();
     metrics.total_passes = 1;
+    for (const auto& [gid, val] : fa.all_aggregates(cfg.agg_func)) {
+        (void)gid;
+        if (val > topKBound_ea) ++metrics.topk_confirmed_pass1;
+    }
 
     ExactAggregates exact_aggregates_ea;
     exact_aggregates_ea.reserve(std::max<size_t>(fa.size() * 2, 1));
@@ -741,6 +749,10 @@ RunMetrics run_zippy_ext_b(
     metrics.topKBound_after_pass1 = topKBound;
     metrics.partitions_pruned_pct = ca.pruning_fraction();
     metrics.total_passes = 1;
+    for (const auto& [gid, val] : fa.all_aggregates(cfg.agg_func)) {
+        (void)gid;
+        if (val > topKBound) ++metrics.topk_confirmed_pass1;
+    }
 
     ExactAggregates exact_aggregates;
     exact_aggregates.reserve(std::max<size_t>(fa.size() * 2, 1));
@@ -905,6 +917,10 @@ RunMetrics run_zippy_ext_ab(
     metrics.topKBound_after_pass1   = topKBound_ab;
     metrics.partitions_pruned_pct   = ca.pruning_fraction();
     metrics.total_passes            = 1;
+    for (const auto& [gid, val] : fa.all_aggregates(cfg.agg_func)) {
+        (void)gid;
+        if (val > topKBound_ab) ++metrics.topk_confirmed_pass1;
+    }
 
     ExactAggregates exact_aggregates_ab;
     exact_aggregates_ab.reserve(std::max<size_t>(fa.size() * 2, 1));
