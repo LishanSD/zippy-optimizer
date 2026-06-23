@@ -249,6 +249,32 @@ public:
         return ids;
     }
 
+    // Return all occupied (group_id, value) pairs WITHOUT sorting.
+    // Prefer over top_k(size(), f) when sorted order is not needed — avoids
+    // the O(N log N) partial_sort over the full FA table.
+    std::vector<std::pair<uint64_t,double>> all_aggregates(AggFunc f) const {
+        std::vector<std::pair<uint64_t,double>> entries;
+        entries.reserve(occupied_);
+        for (const auto& e : table_) {
+            if (e.group_id != FA_EMPTY_KEY)
+                entries.emplace_back(e.group_id, fa_entry_value(e, f));
+        }
+        return entries;
+    }
+
+    // Non-blocking prefetch of the FA table slot for group_id.
+    // Call with a future row's group_id to hide hash-table read latency
+    // in the Pass 1 and multipass hot loops.
+    void prefetch(uint64_t group_id) const {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(&table_[probe(group_id)], 0, 1);
+#elif defined(_MSC_VER)
+        _mm_prefetch(reinterpret_cast<const char*>(&table_[probe(group_id)]), _MM_HINT_T1);
+#else
+        (void)group_id;
+#endif
+    }
+
     // Lowest exact_count among current FA groups — patent uses this as T_c
     // (Section 4.3 / claim 4) when deciding logical vs physical partitioning.
     uint64_t lowest_count() const {
