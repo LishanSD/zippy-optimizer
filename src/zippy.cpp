@@ -258,9 +258,9 @@ static void run_multipass_loop(
 {
     int  level = 2;
     bool done  = active_partitions.empty();
+    const uint64_t t_c = fa.lowest_count();  // FA is frozen after Pass 1; compute once
 
     while (!done && !active_partitions.empty()) {
-        const uint64_t t_c = fa.lowest_count();
         std::unordered_map<size_t, PartitionDecision> decisions;
         decisions.reserve(active_partitions.size());
         size_t pass_exact = 0, pass_logical = 0, pass_physical = 0;
