@@ -862,15 +862,18 @@ RunMetrics run_zippy_ext_ab(
     Timer pass1_timer;
     pass1_timer.reset();
     {
-        size_t row_idx = 0;
-        for (const auto& row : dataset) {
+        constexpr size_t PREFETCH_DIST = 16;
+        const size_t n = dataset.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (i + PREFETCH_DIST < n)
+                fa.prefetch(dataset[i + PREFETCH_DIST].group_id);
+            const auto& row = dataset[i];
             assert(row.group_id != FA_EMPTY_KEY && "group_id must not equal FA sentinel key");
             if (fa.contains(row.group_id)) {
                 fa.update(row.group_id, row.value);
             } else {
-                ca.update_with_segment(row.group_id, row.value, row_idx, cfg.segment_size);
+                ca.update_with_segment(row.group_id, row.value, i, cfg.segment_size);
             }
-            ++row_idx;
         }
     }
 
