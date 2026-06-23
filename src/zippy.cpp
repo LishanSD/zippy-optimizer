@@ -737,10 +737,10 @@ RunMetrics run_zippy_ext_b(
         exact_aggregates[gid] = acc;
     }
 
-    std::vector<std::unordered_set<size_t>> active_history(2);  // index 0 unused
+    std::vector<std::vector<bool>> active_history(2, std::vector<bool>(cfg.n_partitions, false));
     ChildPartitions active_partitions;
     for (size_t pid : ca.ranked_surviving_partitions(cfg.agg_func)) {
-        active_history[1].insert(pid);
+        active_history[1][pid] = true;
         active_partitions.emplace(pid, ca.partition(pid));
     }
 
@@ -898,10 +898,10 @@ RunMetrics run_zippy_ext_ab(
         exact_aggregates_ab[gid] = acc;
     }
 
-    std::vector<std::unordered_set<size_t>> active_history_ab(2);
+    std::vector<std::vector<bool>> active_history_ab(2, std::vector<bool>(cfg.n_partitions, false));
     ChildPartitions active_partitions_ab;
     for (size_t pid : ca.ranked_surviving_partitions(cfg.agg_func)) {
-        active_history_ab[1].insert(pid);
+        active_history_ab[1][pid] = true;
         active_partitions_ab.emplace(pid, ca.partition(pid));
     }
 
