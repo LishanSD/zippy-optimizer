@@ -32,7 +32,7 @@ MODE_MARKERS = {
 
 
 def load_results():
-    """Reads all JSON files in the results directory into a Pandas DataFrame."""
+    """Reads all JSON files in the results directory ."""
     data = []
     filepaths = glob.glob(os.path.join(RESULTS_DIR, "*.json"))
 
